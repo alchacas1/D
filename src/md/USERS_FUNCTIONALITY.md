@@ -1,7 +1,7 @@
 # Users Functionality Documentation
 
 ## Overview
-User editing functionality has been successfully added to the Price-Master application's DataEditor component. This allows for complete CRUD (Create, Read, Update, Delete) operations on user data through Firebase integration.
+User editing functionality has been successfully added to the noname application's DataEditor component. This allows for complete CRUD (Create, Read, Update, Delete) operations on user data through Firebase integration.
 
 ## Features Implemented
 

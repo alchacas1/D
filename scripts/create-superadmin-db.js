@@ -7,7 +7,7 @@ const admin = require('firebase-admin');
 if (!admin.apps.length) {
   // Para desarrollo local, usar el emulador o credenciales de servicio
   admin.initializeApp({
-    projectId: 'price-master-cc9cd',
+    projectId: 'noname-cc9cd',
     // Agregar credenciales de servicio aquí para producción
   });
 }

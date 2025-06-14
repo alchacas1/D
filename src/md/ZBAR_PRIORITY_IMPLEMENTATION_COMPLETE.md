@@ -2,7 +2,7 @@
 
 ## 🎯 RESUMEN EJECUTIVO
 
-**OBJETIVO COMPLETADO**: ZBar-WASM ahora tiene **PRIORIDAD MÁXIMA GARANTIZADA** en todo el sistema de detección de códigos de barras del proyecto Price-Master.
+**OBJETIVO COMPLETADO**: ZBar-WASM ahora tiene **PRIORIDAD MÁXIMA GARANTIZADA** en todo el sistema de detección de códigos de barras del proyecto noname.
 
 ---
 

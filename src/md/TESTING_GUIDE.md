@@ -6,7 +6,7 @@
 
 #### **Paso 1: Iniciar el Servidor**
 ```powershell
-cd c:\Users\chave\Desktop\Diversion\Price-Master
+cd c:\Users\chave\Desktop\Diversion\noname
 npm run dev
 ```
 
@@ -38,7 +38,7 @@ npm run dev
 
 #### **Abrir Archivo de Test**
 ```
-📂 Abrir: c:\Users\chave\Desktop\Diversion\Price-Master\test-session-sync.html
+📂 Abrir: c:\Users\chave\Desktop\Diversion\noname\test-session-sync.html
 ```
 
 #### **Probar Conexiones**

@@ -28,7 +28,7 @@ The error `Cannot read properties of undefined (reading 'getUserMedia')` has bee
 
 ### 1. Start the Development Server
 ```powershell
-cd "c:\Users\chave\Desktop\Diversion\Price-Master"
+cd "c:\Users\chave\Desktop\Diversion\noname"
 npm run dev
 ```
 

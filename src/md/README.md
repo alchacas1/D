@@ -57,7 +57,7 @@ hints.set(DecodeHintType.TRY_HARDER, true); // Análisis más exhaustivo
 1. **Clona el repositorio**
    ```bash
    git clone <url-del-repositorio>
-   cd price-master
+   cd noname
    ```
 2. **Instala las dependencias**
    ```bash
@@ -133,7 +133,7 @@ npm install --save-dev @types/node
 ## 📁 Estructura del Proyecto
 
 ```
-price-master/
+noname/
 ├── src/
 │   ├── app/              # Páginas de Next.js (App Router)
 │   ├── components/       # Componentes de React
