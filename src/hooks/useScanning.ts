@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { ScanningService } from '../services/scanning';
 import type { ScanResult } from '../types/firestore';
 import { useAuth } from './useAuth';
+import { generateShortMobileUrl } from '../utils/shortEncoder';
 
 interface UseScanningOptions {
   autoMarkProcessed?: boolean;
@@ -20,7 +21,7 @@ export function useScanning(options: UseScanningOptions = {}) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newScanCount, setNewScanCount] = useState(0);
-  
+
   const { user } = useAuth();
   const unsubscribeRef = useRef<(() => void) | null>(null);
   const currentSessionId = useRef(sessionId || ScanningService.generateSessionId());
@@ -52,12 +53,12 @@ export function useScanning(options: UseScanningOptions = {}) {
         sessionId: currentSessionId.current,
         processed: false
       });
-      
+
       // If real-time is disabled, reload scans manually
       if (!enableRealTime) {
         await loadScans();
       }
-      
+
       return scanId;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error adding scan');
@@ -70,12 +71,12 @@ export function useScanning(options: UseScanningOptions = {}) {
     try {
       setError(null);
       await ScanningService.markAsProcessed(scanId);
-      
+
       // Update local state
-      setScans(prevScans => 
+      setScans(prevScans =>
         prevScans.filter(scan => scan.id !== scanId)
       );
-      
+
       // Decrease new scan count if it was unprocessed
       setNewScanCount(prev => Math.max(0, prev - 1));
     } catch (err) {
@@ -89,9 +90,9 @@ export function useScanning(options: UseScanningOptions = {}) {
     try {
       setError(null);
       await ScanningService.deleteScan(scanId);
-      
+
       // Update local state
-      setScans(prevScans => 
+      setScans(prevScans =>
         prevScans.filter(scan => scan.id !== scanId)
       );
     } catch (err) {
@@ -104,7 +105,7 @@ export function useScanning(options: UseScanningOptions = {}) {
   const clearAllScans = useCallback(async () => {
     try {
       setError(null);
-      const deletePromises = scans.map(scan => 
+      const deletePromises = scans.map(scan =>
         scan.id ? ScanningService.deleteScan(scan.id) : Promise.resolve()
       );
       await Promise.all(deletePromises);
@@ -122,7 +123,7 @@ export function useScanning(options: UseScanningOptions = {}) {
       if (scan.id) {
         await markAsProcessed(scan.id);
       }
-      
+
       if (onProcess) {
         onProcess(scan.code);
       }
@@ -132,10 +133,10 @@ export function useScanning(options: UseScanningOptions = {}) {
     }
   }, [markAsProcessed]);
 
-  // Get session URL for mobile scanning
-  const getMobileScanUrl = useCallback(() => {
+  // Get session URL for mobile scanning (short URL only)
+  const getMobileScanUrl = useCallback((requestProductName?: boolean) => {
     const baseUrl = window.location.origin;
-    return `${baseUrl}/mobile-scan?session=${currentSessionId.current}`;
+    return generateShortMobileUrl(baseUrl, currentSessionId.current, requestProductName);
   }, []);
 
   // Setup real-time listener
@@ -145,13 +146,13 @@ export function useScanning(options: UseScanningOptions = {}) {
     const handleScansUpdate = (updatedScans: ScanResult[]) => {
       setScans(prevScans => {
         // Count new scans that weren't in the previous state
-        const newScans = updatedScans.filter(newScan => 
+        const newScans = updatedScans.filter(newScan =>
           !prevScans.some(oldScan => oldScan.id === newScan.id)
         );
-        
+
         if (newScans.length > 0) {
           setNewScanCount(prev => prev + newScans.length);
-          
+
           // Auto-mark as processed if enabled
           if (autoMarkProcessed && newScans.length > 0) {
             newScans.forEach(scan => {
@@ -161,7 +162,7 @@ export function useScanning(options: UseScanningOptions = {}) {
             });
           }
         }
-        
+
         return updatedScans;
       });
     };
@@ -177,7 +178,7 @@ export function useScanning(options: UseScanningOptions = {}) {
       handleError,
       sessionId
     );
-    
+
     unsubscribeRef.current = unsubscribe;
 
     return () => {
@@ -215,7 +216,7 @@ export function useScanning(options: UseScanningOptions = {}) {
     error,
     newScanCount,
     sessionId: currentSessionId.current,
-    
+
     // Actions
     addScan,
     markAsProcessed,
@@ -224,10 +225,10 @@ export function useScanning(options: UseScanningOptions = {}) {
     processScan,
     loadScans,
     resetNewScanCount,
-    
+
     // Utils
     getMobileScanUrl,
-    
+
     // State helpers
     hasNewScans: newScanCount > 0,
     totalScans: scans.length

@@ -1,5 +1,5 @@
 'use client';
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ImagePlus as ImagePlusIcon, Clipboard } from 'lucide-react';
 
 interface ImageDropAreaProps {
@@ -35,7 +35,7 @@ export default function ImageDropArea({ onDrop, onFileSelect, fileInputRef, onFi
                 }
             }
         };
-        
+
         window.addEventListener('paste', handlePasteIndicator);
         return () => window.removeEventListener('paste', handlePasteIndicator);
     }, []);
@@ -46,11 +46,10 @@ export default function ImageDropArea({ onDrop, onFileSelect, fileInputRef, onFi
                 Seleccionar imagen
             </label>
             <div
-                className={`relative border-4 border-dashed rounded-3xl p-10 transition-all duration-300 cursor-pointer hover:border-indigo-500 bg-white dark:bg-zinc-900/70 shadow-xl group ${
-                    recentPaste 
-                        ? 'border-green-400 bg-green-50 dark:bg-green-900/20 ring-2 ring-green-400/50' 
-                        : 'border-indigo-200 dark:border-indigo-800'
-                }`}
+                className={`relative border-4 border-dashed rounded-3xl p-10 transition-all duration-300 cursor-pointer hover:border-indigo-500 bg-white dark:bg-zinc-900/70 shadow-xl group ${recentPaste
+                    ? 'border-green-400 bg-green-50 dark:bg-green-900/20 ring-2 ring-green-400/50'
+                    : 'border-indigo-200 dark:border-indigo-800'
+                    }`}
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={onDrop}
@@ -63,21 +62,11 @@ export default function ImageDropArea({ onDrop, onFileSelect, fileInputRef, onFi
                         <span>¡Pegado!</span>
                     </div>
                 )}
-                
+
                 <div className="flex flex-col items-center gap-5 text-indigo-400 dark:text-indigo-300 pointer-events-none">
                     <ImagePlusIcon className="w-20 h-20 group-hover:scale-110 transition-transform duration-300" />
                     <p className="text-xl font-bold">Arrastra una imagen aquí</p>
-                    <p className="text-base">o haz clic para seleccionar archivo</p>                    <div className="flex flex-col items-center gap-2 mt-2">
-                        <p className="text-sm text-indigo-500 dark:text-indigo-400 font-medium">
-                            💡 También puedes usar <kbd className="px-2 py-1 bg-indigo-100 dark:bg-indigo-800 rounded text-xs font-mono">Ctrl+V</kbd> repetidamente
-                        </p>
-                        <p className="text-xs text-indigo-400 dark:text-indigo-500">
-                            Pega múltiples imágenes del portapapeles de forma continua
-                        </p>
-                        <p className="text-xs text-green-600 dark:text-green-400 font-medium">
-                            ⚡ Análisis inmediato - Sin esperas ni retrasos
-                        </p>
-                    </div>
+                    <p className="text-base">o haz clic para seleccionar archivo</p>
                     <input
                         ref={fileInputRef}
                         type="file"

@@ -1,21 +1,22 @@
-import { 
-  collection, 
-  doc, 
-  getDocs, 
-  getDoc, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  query, 
-  where,   orderBy, 
+import {
+  collection,
+  doc,
+  getDocs,
+  getDoc,
+  addDoc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  query,
+  where, orderBy,
   limit
 } from 'firebase/firestore';
 import { db } from '../config/firebase';
 
 export class FirestoreService {
-    /**
-   * Get all documents from a collection
-   */
+  /**
+ * Get all documents from a collection
+ */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   static async getAll(collectionName: string): Promise<any[]> {
     try {
@@ -37,7 +38,7 @@ export class FirestoreService {
     try {
       const docRef = doc(db, collectionName, id);
       const docSnap = await getDoc(docRef);
-      
+
       if (docSnap.exists()) {
         return {
           id: docSnap.id,
@@ -62,6 +63,20 @@ export class FirestoreService {
       return docRef.id;
     } catch (error) {
       console.error(`Error adding document to ${collectionName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Add a new document with a specific ID to a collection
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  static async addWithId(collectionName: string, id: string, data: any): Promise<void> {
+    try {
+      const docRef = doc(db, collectionName, id);
+      await setDoc(docRef, data);
+    } catch (error) {
+      console.error(`Error adding document ${id} to ${collectionName}:`, error);
       throw error;
     }
   }
@@ -94,7 +109,7 @@ export class FirestoreService {
    * Query documents with conditions
    */
   static async query(
-    collectionName: string, 
+    collectionName: string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     conditions: Array<{ field: string; operator: any; value: any }> = [],
     orderByField?: string,
@@ -105,26 +120,26 @@ export class FirestoreService {
     try {
       // eslint-disable-next-line prefer-const
       let q = collection(db, collectionName);
-      
+
       // Apply where conditions
       const constraints = [];
       conditions.forEach(condition => {
         constraints.push(where(condition.field, condition.operator, condition.value));
       });
-      
+
       // Apply order by
       if (orderByField) {
         constraints.push(orderBy(orderByField, orderDirection));
       }
-      
+
       // Apply limit
       if (limitCount) {
         constraints.push(limit(limitCount));
       }
-      
+
       const queryRef = query(q, ...constraints);
       const querySnapshot = await getDocs(queryRef);
-      
+
       return querySnapshot.docs.map(doc => ({
         id: doc.id,
         ...doc.data()

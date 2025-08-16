@@ -1,18 +1,19 @@
 import { LocationsService } from '../services/locations';
 import { SorteosService } from '../services/sorteos';
 import { UsersService } from '../services/users';
+import { CcssConfigService } from '../services/ccss-config';
 import { Location } from '../types/firestore';
 import locationsData from '../data/locations.json';
 import sorteosData from '../data/sorteos.json';
 
 export class MigrationService {
-  
+
   /**
    * Migrate locations from JSON to Firestore
    */
   static async migrateLocations(): Promise<void> {
     console.log('Starting locations migration...');
-    
+
     try {
       // Check if locations already exist
       const existingLocations = await LocationsService.getAllLocations();
@@ -43,7 +44,7 @@ export class MigrationService {
    */
   static async migrateSorteos(): Promise<void> {
     console.log('Starting sorteos migration...');
-    
+
     try {
       // Check if sorteos already exist
       const existingSorteos = await SorteosService.getAllSorteos();
@@ -70,12 +71,12 @@ export class MigrationService {
   /**
    * Run all migrations
    */
-  static async runAllMigrations(): Promise<void> {
-    console.log('Starting data migration from JSON to Firestore...');
-    
+  static async runAllMigrations(): Promise<void> {    console.log('Starting data migration from JSON to Firestore...');
+
     try {
       await this.migrateLocations();
       await this.migrateSorteos();
+      await CcssConfigService.initializeCcssConfig();
       console.log('All migrations completed successfully!');
     } catch (error) {
       console.error('Migration failed:', error);
@@ -87,7 +88,7 @@ export class MigrationService {
    */
   static async clearAllData(): Promise<void> {
     console.log('WARNING: Clearing all Firestore data...');
-    
+
     try {
       // Clear locations
       const locations = await LocationsService.getAllLocations();
@@ -105,9 +106,7 @@ export class MigrationService {
           await SorteosService.deleteSorteo(sorteo.id);
         }
       }
-      console.log(`Deleted ${sorteos.length} sorteos.`);
-
-      // Clear users
+      console.log(`Deleted ${sorteos.length} sorteos.`);      // Clear users
       const users = await UsersService.getAllUsers();
       for (const user of users) {
         if (user.id) {
@@ -115,6 +114,20 @@ export class MigrationService {
         }
       }
       console.log(`Deleted ${users.length} users.`);
+
+      // Clear CCSS configuration
+      try {
+        // We don't delete the CCSS config, just reset it to default values
+        await CcssConfigService.updateCcssConfig({
+          mt: 3672.46,
+          tc: 11017.39,
+          valorhora: 1441,
+          horabruta: 1529.62
+        });
+        console.log('CCSS configuration reset to default values.');
+      } catch (error) { // eslint-disable-line @typescript-eslint/no-unused-vars
+        console.log('CCSS configuration not found or already at defaults.');
+      }
 
       console.log('All Firestore data cleared successfully!');
     } catch (error) {

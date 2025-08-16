@@ -157,16 +157,16 @@ export function preprocessImage(imageData: ImageData): ImageData {
   return processedData;
 }
 
-// --- Decodificación con Quagga2 (imagen estática) - OPTIMIZADO PARA VELOCIDAD ---
+// --- Decodificación con Quagga2 (imagen estática) ---
 export async function detectWithQuagga2(imageData: ImageData, fallbackDelay: number = 0): Promise<string | null> {
   // Usar requestAnimationFrame para procesamiento inmediato sin bloquear UI
   await new Promise(resolve => requestAnimationFrame(resolve));
-  
+
   // El fallbackDelay ahora es 0 para análisis inmediato
   if (fallbackDelay > 0) {
     await new Promise(resolve => setTimeout(resolve, fallbackDelay));
   }
-  
+
   // Import dinámico para evitar require y problemas SSR
   const Quagga = (await import('@ericblade/quagga2')).default;
   const canvas = document.createElement('canvas');

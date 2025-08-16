@@ -1,7 +1,13 @@
-'use client';
+'use client'; 
 import React, { useState } from 'react';
+import { Lock as LockIcon } from 'lucide-react';
+import { useAuth } from '../hooks/useAuth';
+import { hasPermission } from '../utils/permissions';
 
 export default function TextConversion() {
+  /* Verificar permisos del usuario */
+  const { user } = useAuth();
+
   const [text, setText] = useState('');
   const [copySuccess, setCopySuccess] = useState(false);
   const copyToClipboard = async (value: string) => {
@@ -28,6 +34,51 @@ export default function TextConversion() {
       console.error('Error copying to clipboard:', error);
     }
   };
+
+  const pasteFromClipboard = async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        const clipboardText = await navigator.clipboard.readText();
+        setText(clipboardText);
+      } else {
+        // Fallback message for older browsers
+        alert('Paste functionality not supported in this browser. Please paste manually.');
+      }
+    } catch (error) {
+      console.error('Error reading from clipboard:', error);
+      alert('Unable to access clipboard. Please paste manually.');
+    }
+  };
+
+  const toTitleCase = (str: string) => {
+    return str.replace(/\w\S*/g, (txt) => {
+      return txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase();
+    });
+  };
+
+  const clearInput = () => {
+    setText('');
+  };
+
+  // Verificar si el usuario tiene permiso para usar el conversor
+  if (!hasPermission(user?.permissions, 'converter')) {
+    return (
+      <div className="flex items-center justify-center p-8 bg-[var(--card-bg)] rounded-lg border border-[var(--input-border)]">
+        <div className="text-center">
+          <LockIcon className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+          <h3 className="text-lg font-semibold text-[var(--foreground)] mb-2">
+            Acceso Restringido
+          </h3>
+          <p className="text-[var(--muted-foreground)]">
+            No tienes permisos para acceder al Conversor de Texto.
+          </p>
+          <p className="text-sm text-[var(--muted-foreground)] mt-2">
+            Contacta a un administrador para obtener acceso.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -88,6 +139,48 @@ export default function TextConversion() {
           onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--button-bg)')}
         >
           To Lowercase
+        </button>
+        <button
+          onClick={() => {
+            const titleCaseText = toTitleCase(text);
+            setText(titleCaseText);
+            copyToClipboard(titleCaseText);
+          }}
+          className="w-full px-6 py-4 text-xl rounded-md transition-colors font-medium"
+          style={{
+            background: 'var(--button-bg)',
+            color: 'var(--button-text)',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--button-hover)')}
+          onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--button-bg)')}
+        >
+          To Title Case (Aa)
+        </button>
+      </div>
+      <div className="flex flex-col sm:flex-row gap-4 w-full mt-4">
+        <button
+          onClick={clearInput}
+          className="w-full px-6 py-4 text-xl rounded-md transition-colors font-medium"
+          style={{
+            background: 'var(--button-bg)',
+            color: 'var(--button-text)',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--button-hover)')}
+          onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--button-bg)')}
+        >
+          Limpiar
+        </button>
+        <button
+          onClick={pasteFromClipboard}
+          className="w-full px-6 py-4 text-xl rounded-md transition-colors font-medium"
+          style={{
+            background: 'var(--button-bg)',
+            color: 'var(--button-text)',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--button-hover)')}
+          onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--button-bg)')}
+        >
+          Pegar
         </button>
       </div>
     </div>

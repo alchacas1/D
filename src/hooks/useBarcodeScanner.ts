@@ -11,9 +11,11 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
   const [copySuccess, setCopySuccess] = useState(false);
   const [detectionMethod, setDetectionMethod] = useState('');
   const [cameraActive, setCameraActive] = useState(false);
+
   const imgRef = useRef<HTMLImageElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const liveStreamRef = useRef<HTMLDivElement>(null);
+  const zbarIntervalRef = useRef<number | null>(null);
   const hiddenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   // Copiar código al portapapeles
   const copyCodeToClipboard = async (codeText: string) => {
@@ -71,19 +73,20 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
     setCopySuccess(false);
     setDetectionMethod('');
   };
-  // Procesar imagen (pipeline: ZBar → Quagga2 → Básica) - OPTIMIZADO PARA VELOCIDAD
+
+  // Procesar imagen (pipeline: ZBar → Quagga2 → Básica)
   const processImage = useCallback(
     async (imageSrc: string) => {
       clearState();
       setIsLoading(true);
       setImagePreview(imageSrc);
       setError('');
-      
+
       // Usar requestAnimationFrame para procesamiento inmediato sin bloquear UI
       await new Promise(resolve => requestAnimationFrame(resolve));
-      
+
       try {
-        // 1) Extraer ImageData de la imagen cargada - OPTIMIZADO
+        // 1) Extraer ImageData de la imagen cargada
         const img = new window.Image();
         img.crossOrigin = 'anonymous';
         const imageLoaded = new Promise<HTMLImageElement>((resolve, reject) => {
@@ -99,28 +102,29 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
         canvas.height = loadedImg.naturalHeight;
         ctx.drawImage(loadedImg, 0, 0);
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        
+
         let detectedCode = '';
         let usedMethod = '';
-        
+
         // 1. ZBar‑WASM (MÁXIMA PRIORIDAD - siempre se intenta PRIMERO)
         logZbarPriority('ZBAR_START', 'Procesando imagen con ZBar-WASM');
         try {
           const symbols = await scanImageData(imageData);
           if (symbols && symbols.length > 0) {
             const code = symbols[0].decode();
-            if (code && 
-                ZBAR_PRIORITY_CONFIG.VALID_CODE_PATTERN.test(code) &&
-                code.length >= ZBAR_PRIORITY_CONFIG.MIN_CODE_LENGTH &&
-                code.length <= ZBAR_PRIORITY_CONFIG.MAX_CODE_LENGTH) {
+            if (code &&
+              ZBAR_PRIORITY_CONFIG.VALID_CODE_PATTERN.test(code) &&
+              code.length >= ZBAR_PRIORITY_CONFIG.MIN_CODE_LENGTH &&
+              code.length <= ZBAR_PRIORITY_CONFIG.MAX_CODE_LENGTH) {
               detectedCode = code;
               usedMethod = 'ZBar‑WASM (PRIORIDAD MÁXIMA)';
               logZbarPriority('ZBAR_SUCCESS', 'ZBar-WASM detectó código', code);
             }
-          }        } catch {
+          }
+        } catch {
           logZbarPriority('ZBAR_PROCESSING', 'ZBar-WASM procesando, continuando con fallback');
         }
-        
+
         // 2. Quagga2 (SOLO si ZBar-WASM no detectó nada)
         if (!detectedCode) {
           logZbarPriority('QUAGGA_FALLBACK', 'ZBar-WASM no detectó código, iniciando fallback con Quagga2');
@@ -131,13 +135,14 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
               detectedCode = quaggaResult;
               usedMethod = 'Quagga 2 (Fallback)';
               logZbarPriority('QUAGGA_SUCCESS', 'Quagga2 detectó código como fallback', quaggaResult);
-            }          } catch {
+            }
+          } catch {
             logZbarPriority('ZBAR_PROCESSING', 'Error en Quagga2 fallback, continuando...');
           }
         } else {
           logZbarPriority('QUAGGA_IGNORED', 'Quagga2 no ejecutado - ZBar-WASM ya detectó código');
         }
-        
+
         // 3. Básica (preprocesada y sin preprocesar)
         if (!detectedCode) {
           const preprocessedData = preprocessImage(imageData);
@@ -175,14 +180,14 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
     },
     [onDetect]
   );
-  // Handlers para input file, drop, click área - OPTIMIZADO PARA ANÁLISIS INMEDIATO
+
+  // Handlers para input file, drop, click área
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file && file.type.startsWith('image/')) {
       const reader = new FileReader();
       reader.onload = (e) => {
         const imageSrc = e.target?.result as string;
-        // Procesamiento inmediato sin setTimeout
         processImage(imageSrc);
       };
       reader.onerror = () => {
@@ -202,7 +207,6 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
       const reader = new FileReader();
       reader.onload = (e) => {
         const imageSrc = e.target?.result as string;
-        // Procesamiento inmediato sin setTimeout
         processImage(imageSrc);
       };
       reader.onerror = () => {
@@ -240,8 +244,10 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
     setError('');
     setCameraActive((prev) => !prev);
   }, []);
-  // --- Cámara: iniciar/detener Quagga2 LiveStream - OPTIMIZADO PARA ANÁLISIS INMEDIATO ---
+
+  // --- Cámara: iniciar/detener Quagga2 LiveStream ---
   useEffect(() => {
+    let zbarInterval: number | null = null;
     let lastZbarCode = '';
     let lastQuaggaCode = '';
     const cleanupRef: HTMLDivElement | null = liveStreamRef.current;
@@ -297,13 +303,13 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
             // Apply CSS classes to the video element so it fully fills the container
             const videoElem = liveStreamRef.current?.querySelector('video');
             if (videoElem) {
-              videoElem.classList.add('absolute','inset-0','w-full','h-full','object-cover');
+              videoElem.classList.add('absolute', 'inset-0', 'w-full', 'h-full', 'object-cover');
               videoElem.setAttribute('playsinline', 'true');
             }
           }
-        );        // --- ZBar-WASM con requestAnimationFrame para MÁXIMA VELOCIDAD Y PRIORIDAD ---
-        const scanFrame = async () => {
-          if (!liveStreamRef.current || !cameraActive) return;
+        );        // --- ZBar-WASM con intervalo optimizado para MÁXIMA PRIORIDAD ---
+        zbarInterval = window.setInterval(async () => {
+          if (!liveStreamRef.current) return;
           const videoElem = liveStreamRef.current.querySelector('video') as HTMLVideoElement | null;
           if (videoElem && videoElem.readyState === 4) {
             const vWidth = videoElem.videoWidth;
@@ -322,11 +328,11 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
                 const symbols = await scanImageData(frameData);
                 if (symbols && symbols.length > 0) {
                   const zbarCode = symbols[0].decode();
-                  if (zbarCode && 
-                      zbarCode !== lastZbarCode &&
-                      ZBAR_PRIORITY_CONFIG.VALID_CODE_PATTERN.test(zbarCode) &&
-                      zbarCode.length >= ZBAR_PRIORITY_CONFIG.MIN_CODE_LENGTH &&
-                      zbarCode.length <= ZBAR_PRIORITY_CONFIG.MAX_CODE_LENGTH) {
+                  if (zbarCode &&
+                    zbarCode !== lastZbarCode &&
+                    ZBAR_PRIORITY_CONFIG.VALID_CODE_PATTERN.test(zbarCode) &&
+                    zbarCode.length >= ZBAR_PRIORITY_CONFIG.MIN_CODE_LENGTH &&
+                    zbarCode.length <= ZBAR_PRIORITY_CONFIG.MAX_CODE_LENGTH) {
                     lastZbarCode = zbarCode;
                     setCode(zbarCode);
                     setDetectionMethod('Cámara (ZBar‑WASM PRIORIDAD MÁXIMA)');
@@ -335,24 +341,19 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
                     if (onDetect) onDetect(zbarCode);
                     Quagga.stop();
                     setCameraActive(false);
+                    if (zbarInterval) window.clearInterval(zbarInterval);
                     return;
-                  }                }
-                // SOLO SI ZBAR NO DETECTA, USAR QUAGGA
+                  }
+                }                // SOLO SI ZBAR NO DETECTA, USAR QUAGGA
                 // (NO hacer nada aquí, Quagga.onDetected solo se ejecuta si ZBar no detecta nada)
               } catch {
                 logZbarPriority('ZBAR_PROCESSING', 'ZBar-WASM procesando frame...');
               }
             }
           }
-          
-          // Continuar escaneando con requestAnimationFrame para máximo rendimiento
-          if (cameraActive) {
-            requestAnimationFrame(scanFrame);
-          }
-        };
+        }, ZBAR_PRIORITY_CONFIG.ZBAR_SCAN_INTERVAL); // Usar configuración de intervalo
         
-        // Iniciar el escaneo continuo
-        requestAnimationFrame(scanFrame);// Quagga2 detection SOLO SI ZBar no detecta (con configuración mejorada)
+        // Quagga2 detection SOLO SI ZBar no detecta (con configuración mejorada)
         Quagga.offDetected(); // Elimina cualquier listener anterior para evitar duplicados
         Quagga.onDetected((data: { codeResult?: { code: string | null } }) => {
           if (lastZbarCode) {
@@ -361,18 +362,18 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
           }
           const code = data.codeResult?.code;
           // Usar validación de la configuración de prioridad
-          const valid = typeof code === 'string' && 
-                       ZBAR_PRIORITY_CONFIG.VALID_CODE_PATTERN.test(code) && 
-                       code.length >= ZBAR_PRIORITY_CONFIG.MIN_CODE_LENGTH && 
-                       code.length <= ZBAR_PRIORITY_CONFIG.MAX_CODE_LENGTH;          if (valid && code !== lastQuaggaCode) {
-            lastQuaggaCode = code;
-            setCode(code);
-            setDetectionMethod('Cámara (Quagga2 Fallback)');
-            logZbarPriority('QUAGGA_SUCCESS', 'Quagga2 detectó código como fallback en cámara', code);            copyCodeToClipboard(code);
-            if (onDetect) onDetect(code);
-            Quagga.stop();
-            setCameraActive(false);
-          }
+          const valid = typeof code === 'string' &&
+            ZBAR_PRIORITY_CONFIG.VALID_CODE_PATTERN.test(code) &&
+            code.length >= ZBAR_PRIORITY_CONFIG.MIN_CODE_LENGTH &&
+            code.length <= ZBAR_PRIORITY_CONFIG.MAX_CODE_LENGTH; if (valid && code !== lastQuaggaCode) {
+              lastQuaggaCode = code;
+              setCode(code);
+              setDetectionMethod('Cámara (Quagga2 Fallback)');
+              logZbarPriority('QUAGGA_SUCCESS', 'Quagga2 detectó código como fallback en cámara', code); copyCodeToClipboard(code);
+              if (onDetect) onDetect(code);
+              Quagga.stop();
+              setCameraActive(false);
+            }
         });
       } catch {
         setError('Error al iniciar la cámara.');
@@ -381,11 +382,12 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
     }
     if (cameraActive) {
       startCamera();
-    } else {      (async () => {
+    } else {
+      (async () => {
         try {
           const Quagga = (await import('@ericblade/quagga2')).default;
           Quagga.stop();
-        } catch {}
+        } catch { }
         if (cleanupRef) {
           while (cleanupRef.firstChild) cleanupRef.removeChild(cleanupRef.firstChild);
         }
@@ -396,7 +398,7 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
         try {
           const Quagga = (await import('@ericblade/quagga2')).default;
           Quagga.stop();
-        } catch {}
+        } catch { }
         if (cleanupRef) {
           while (cleanupRef.firstChild) cleanupRef.removeChild(cleanupRef.firstChild);
         }
@@ -414,13 +416,14 @@ export function useBarcodeScanner(onDetect?: (code: string, productName?: string
     detectionMethod,
     cameraActive,
     setCameraActive,
-    setCode,    setError,
+    setCode, setError,
     setImagePreview,
     setCopySuccess,
     setDetectionMethod,
     imgRef,
     fileInputRef,
     liveStreamRef,
+    zbarIntervalRef,
     hiddenCanvasRef,
     handleFileUpload,
     handleDrop,
