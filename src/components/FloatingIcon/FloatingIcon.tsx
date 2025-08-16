@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '@/hooks/useAuth';
-import { useChatSocket } from '@/hooks/useChatSocket';
+import { useChatPolling } from '@/hooks/useChatPolling'; // Cambiado a polling
 import CompactChat from '@/components/CompactChat';
 
 const FloatingIcon = () => {
@@ -23,7 +23,7 @@ const FloatingIcon = () => {
         displayName: user.location || user.name // Lo que se mostrará en el chat
     } : null;
     
-    const { unreadCount, markAsRead, isConnected } = useChatSocket(chatUser);
+    const { unreadCount, markAsRead, isConnected } = useChatPolling(chatUser);
 
     const handleClick = () => {
         // Solo permitir chat si el usuario está autenticado y estamos en el cliente
