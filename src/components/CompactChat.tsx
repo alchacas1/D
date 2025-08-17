@@ -213,7 +213,7 @@ export default function CompactChat({ user, onClose }: CompactChatProps) {
                     {connectedUser.displayName?.charAt(0)?.toUpperCase() || '?'}
                   </div>
                   <span className="text-gray-700 dark:text-gray-300 font-medium flex-1 truncate">
-                    {connectedUser.displayName || 'Usuario'}
+                    {connectedUser.displayName || connectedUser.name || user.displayName}
                   </span>
                   <div className="w-1.5 h-1.5 bg-green-400 rounded-full"></div>
                 </div>
