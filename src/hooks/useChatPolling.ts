@@ -25,7 +25,6 @@ export function useChatPolling(user: ChatUser | null) {
   const [userId, setUserId] = useState<string | null>(null);
   
   const lastMessageId = useRef<number>(0);
-  const pollingInterval = useRef<NodeJS.Timeout | null>(null);
   const isPollingActive = useRef(false);
 
   // Función para obtener o crear userId persistente
@@ -47,13 +46,18 @@ export function useChatPolling(user: ChatUser | null) {
     setUnreadCount(0);
   }, []);
 
-  // Función para hacer polling
+  // Función para hacer long polling
   const pollMessages = useCallback(async () => {
     if (!userId || !isPollingActive.current) return;
     
     try {
-      const response = await fetch(`/api/chat-polling?lastMessageId=${lastMessageId.current}&userId=${userId}`);
-      if (response.ok) {
+      // Long polling - la request se mantiene abierta hasta recibir datos o timeout
+      const response = await fetch(`/api/chat-polling?lastMessageId=${lastMessageId.current}&userId=${userId}`, {
+        // Timeout de 30 segundos para long polling
+        signal: AbortSignal.timeout(30000)
+      });
+      
+      if (response.ok && isPollingActive.current) {
         const data = await response.json();
         
         if (data.messages && data.messages.length > 0) {
@@ -89,12 +93,33 @@ export function useChatPolling(user: ChatUser | null) {
         }
         
         setIsConnected(true);
+        
+        // Inmediatamente iniciar otra request de long polling
+        if (isPollingActive.current) {
+          setTimeout(pollMessages, 100); // Pequeña pausa antes de la siguiente request
+        }
       } else {
         setIsConnected(false);
+        // Si falla, reintentar después de un tiempo
+        if (isPollingActive.current) {
+          setTimeout(pollMessages, 3000);
+        }
       }
-    } catch (error) {
-      console.error('Error en polling:', error);
+    } catch (error: unknown) {
+      // Si es timeout o error de red, reintentar
+      const errorObj = error as Error;
+      if (errorObj?.name === 'TimeoutError' || errorObj?.name === 'AbortError') {
+        console.log('Long polling timeout, reintentando...');
+      } else {
+        console.error('Error en long polling:', error);
+      }
+      
       setIsConnected(false);
+      
+      // Reintentar después de un tiempo si sigue activo
+      if (isPollingActive.current) {
+        setTimeout(pollMessages, 2000);
+      }
     }
   }, [userId]);
 
@@ -112,7 +137,7 @@ export function useChatPolling(user: ChatUser | null) {
           action: 'message',
           data: {
             text: text.trim(),
-            user: user?.displayName || 'Usuario',
+            user: user?.displayName || user?.name || 'Usuario',
             userId: userId
           }
         })
@@ -150,7 +175,7 @@ export function useChatPolling(user: ChatUser | null) {
             userId: persistentUserId, // Enviar el userId persistente
             name: user.name,
             location: user.location,
-            displayName: user.displayName
+            displayName: user.displayName || user.name // Fallback a user.name si displayName no está definido
           }
         })
       });
@@ -185,34 +210,77 @@ export function useChatPolling(user: ChatUser | null) {
     }
   }, [user, userId, isConnected, joinChat]);
 
-  // Configurar polling
+  // Configurar long polling
   useEffect(() => {
     if (userId && isConnected) {
       isPollingActive.current = true;
       
-      // Polling cada 2 segundos
-      pollingInterval.current = setInterval(pollMessages, 2000);
-      
-      // Polling inicial
+      // Iniciar long polling (sin intervalo, se auto-repite)
       pollMessages();
       
       return () => {
         isPollingActive.current = false;
-        if (pollingInterval.current) {
-          clearInterval(pollingInterval.current);
-        }
+        // No necesitamos clearInterval porque long polling no usa intervalos
       };
     }
   }, [userId, isConnected, pollMessages]);
+
+  // Detectar cuando el usuario sale de la página o cierra sesión
+  useEffect(() => {
+    if (!userId || !user) return;
+
+    // Función para enviar leave al servidor cuando se sale de la página
+    const handlePageLeave = async () => {
+      if (userId) {
+        try {
+          // Usar sendBeacon para envío confiable durante el unload
+          const data = JSON.stringify({
+            action: 'leave',
+            data: { userId }
+          });
+          
+          navigator.sendBeacon('/api/chat-polling', data);
+        } catch (error) {
+          console.error('Error enviando leave:', error);
+        }
+      }
+    };
+
+    // Detectar cierre de pestaña/ventana
+    const handleBeforeUnload = () => {
+      handlePageLeave();
+    };
+
+    // Detectar cuando la página se oculta (cambio de pestaña, minimizar, etc.)
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        handlePageLeave();
+      }
+    };
+
+    // Detectar cambio de enfoque de la ventana
+    const handleBlur = () => {
+      handlePageLeave();
+    };
+
+    // Agregar event listeners
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', handleBlur);
+
+    // Cleanup
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [userId, user]);
 
   // Cleanup al desmontar
   useEffect(() => {
     return () => {
       // Solo limpiar polling, no enviar mensaje de salida
       isPollingActive.current = false;
-      if (pollingInterval.current) {
-        clearInterval(pollingInterval.current);
-      }
     };
   }, []);
 
@@ -224,9 +292,6 @@ export function useChatPolling(user: ChatUser | null) {
     setUnreadCount(0);
     // No limpiar el userId aquí para mantener la persistencia
     isPollingActive.current = false;
-    if (pollingInterval.current) {
-      clearInterval(pollingInterval.current);
-    }
   }, []);
 
   // Función para limpiar completamente el usuario (logout real)
