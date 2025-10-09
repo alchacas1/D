@@ -2,7 +2,7 @@ import { FirestoreService } from './firestore';
 
 export interface ScheduleEntry {
   id?: string;
-  locationValue: string;
+  companieValue: string;
   employeeName: string;
   year: number;
   month: number;
@@ -69,7 +69,7 @@ export class SchedulesService {
     month: number
   ): Promise<ScheduleEntry[]> {
     return await FirestoreService.query(this.COLLECTION_NAME, [
-      { field: 'locationValue', operator: '==', value: locationValue },
+      { field: 'companieValue', operator: '==', value: locationValue },
       { field: 'employeeName', operator: '==', value: employeeName },
       { field: 'year', operator: '==', value: year },
       { field: 'month', operator: '==', value: month }
@@ -88,7 +88,7 @@ export class SchedulesService {
   ): Promise<ScheduleEntry> {
     // First try to find existing entry
     const existing = await FirestoreService.query(this.COLLECTION_NAME, [
-      { field: 'locationValue', operator: '==', value: locationValue },
+      { field: 'companieValue', operator: '==', value: locationValue },
       { field: 'employeeName', operator: '==', value: employeeName },
       { field: 'year', operator: '==', value: year },
       { field: 'month', operator: '==', value: month },
@@ -101,7 +101,7 @@ export class SchedulesService {
 
     // Create new entry if it doesn't exist
     const newEntry = {
-      locationValue,
+      companieValue: locationValue,
       employeeName,
       year,
       month,
@@ -123,7 +123,7 @@ export class SchedulesService {
     day: number
   ): Promise<ScheduleEntry | null> {
     const existing = await FirestoreService.query(this.COLLECTION_NAME, [
-      { field: 'locationValue', operator: '==', value: locationValue },
+      { field: 'companieValue', operator: '==', value: locationValue },
       { field: 'employeeName', operator: '==', value: employeeName },
       { field: 'year', operator: '==', value: year },
       { field: 'month', operator: '==', value: month },
@@ -147,7 +147,7 @@ export class SchedulesService {
   ): Promise<void> {
     try {
       // Find existing entry first
-      const existingEntry = await this.findScheduleEntry(locationValue, employeeName, year, month, day);
+  const existingEntry = await this.findScheduleEntry(locationValue, employeeName, year, month, day);
 
       if (shift === '' || shift.trim() === '') {
         // If setting to empty and document exists, DELETE it
@@ -159,13 +159,13 @@ export class SchedulesService {
       } else {
         // Get employee hoursPerShift from location data only for work shifts (D or N)
         let horasPorDia: number | undefined;
-        
+
         if (shift === 'D' || shift === 'N') {
           try {
-            const { LocationsService } = await import('./locations');
-            const locations = await LocationsService.findLocationsByValue(locationValue);
-            const location = locations[0];
-            const employee = location?.employees?.find(emp => emp.name === employeeName);
+            const { EmpresasService } = await import('./empresas');
+            const empresas = await EmpresasService.getAllEmpresas();
+            const empresa = empresas.find(emp => emp.name.toLowerCase() === locationValue.toLowerCase());
+            const employee = empresa?.empleados?.find(emp => emp.Empleado === employeeName);
             horasPorDia = employee?.hoursPerShift || 8; // Default to 8 hours if not specified
             console.log(`🔄 Adding horasPorDia for ${employeeName} (${shift}): ${horasPorDia} hours`);
           } catch (error) {
@@ -188,7 +188,7 @@ export class SchedulesService {
         } else {
           // Create new document with shift and horasPorDia (only if defined)
           const newSchedule: Omit<ScheduleEntry, 'id' | 'createdAt' | 'updatedAt'> = {
-            locationValue,
+            companieValue: locationValue,
             employeeName,
             year,
             month,
@@ -234,14 +234,14 @@ export class SchedulesService {
         // If hours > 0, create or update the document
         if (existingEntry && existingEntry.id) {
           // Update existing document with shift 'L' and specific horasPorDia
-          await this.updateSchedule(existingEntry.id, { 
+          await this.updateSchedule(existingEntry.id, {
             shift: 'L',
             horasPorDia: horasPorDia
           });
         } else {
           // Create new document with shift 'L' and specific horasPorDia
           await this.addSchedule({
-            locationValue,
+            companieValue: locationValue,
             employeeName,
             year,
             month,

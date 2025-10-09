@@ -2,29 +2,16 @@
 'use client'
 
 import React, { useState, useEffect, useCallback } from 'react'
-import BarcodeScanner from '@/components/BarcodeScanner'
-import PriceCalculator from '@/components/PriceCalculator'
-import TextConversion from '@/components/TextConversion'
-import ScanHistory from '@/components/ScanHistory'
-import CashCounterTabs from '@/components/CashCounterTabs'
-import ControlHorario from '@/components/ControlHorario'
+import { BarcodeScanner } from '@/components/scanner'
+import { PriceCalculator, TextConversion } from '@/components/calculator'
+import { ScanHistory } from '@/components/scanner'
+import { CashCounterTabs, ControlHorario, TimingControl, SupplierOrders } from '@/components/business'
 import { useAuth } from '@/hooks/useAuth'
-import {
-  Calculator,
-  Smartphone,
-  Type, Banknote,
-  Scan,
-  Clock,
-  Truck,
-  Settings,
-  History,
-} from 'lucide-react'
+/*import { Calculator, Smartphone, Type, Banknote, Scan, Clock, Truck, Settings, History, } from lucide-react'*/
 import type { ScanHistoryEntry } from '@/types/barcode'
-import TimingControl from '@/components/TimingControl'
-import ClientOnlyHomeMenu from '@/components/ClientOnlyHomeMenu'
-import SupplierOrders from '@/components/SupplierOrders'
-import Mantenimiento from '@/components/Mantenimiento'
-import ScanHistoryTable from '@/components/ScanHistoryTable'
+import { ClientOnlyHomeMenu } from '@/components/layout'
+import { Mantenimiento } from '@/components/admin'
+import { ScanHistoryTable } from '@/components/scanner'
 import { storage } from '@/config/firebase'
 import { ref, listAll } from 'firebase/storage'
 
@@ -41,26 +28,28 @@ export default function HomePage() {
   const [notification, setNotification] = useState<{ message: string; color: string } | null>(null);
 
   // Helper function to get tab info
-  const getTabInfo = (tabId: ActiveTab | null) => {
-    const tabs = [
-      { id: 'scanner' as ActiveTab, name: 'Escáner', icon: Scan, description: 'Escanear códigos de barras' },
-      { id: 'calculator' as ActiveTab, name: 'Calculadora', icon: Calculator, description: 'Calcular precios con descuentos' },
-      { id: 'converter' as ActiveTab, name: 'Conversor', icon: Type, description: 'Convertir y transformar texto' },
-      {
-        id: 'cashcounter' as ActiveTab,
-        name: 'Contador Efectivo',
-        icon: Banknote,
-        description: 'Contar billetes y monedas (CRC/USD)'
-      },
-      { id: 'timingcontrol' as ActiveTab, name: 'Control Tiempos', icon: Smartphone, description: 'Registro de venta de tiempos' },
-      { id: 'controlhorario' as ActiveTab, name: 'Control Horario', icon: Clock, description: 'Registro de horarios de trabajo' },
-      { id: 'supplierorders' as ActiveTab, name: 'Órdenes Proveedor', icon: Truck, description: 'Gestión de órdenes de proveedores' },
-      { id: 'scanhistory' as ActiveTab, name: 'Historial de Escaneos', icon: History, description: 'Ver historial completo de escaneos' },
-      { id: 'edit' as ActiveTab, name: 'Mantenimiento', icon: Settings, description: 'Gestión y mantenimiento del sistema' },
-    ];
-    return tabs.find(t => t.id === tabId);
-  };
-
+  {/*TODO: DESCOMENTAR LO SIGUIENTE SI SE QUIERE LAS DESCRIPCIONES EN LAS PESTAÑAS */ }
+  /*
+    const getTabInfo = (tabId: ActiveTab | null) => {
+      const tabs = [
+        { id: 'scanner' as ActiveTab, name: 'Escáner', icon: Scan, description: 'Escanear códigos de barras' },
+        { id: 'calculator' as ActiveTab, name: 'Calculadora', icon: Calculator, description: 'Calcular precios con descuentos' },
+        { id: 'converter' as ActiveTab, name: 'Conversor', icon: Type, description: 'Convertir y transformar texto' },
+        {
+          id: 'cashcounter' as ActiveTab,
+          name: 'Contador Efectivo',
+          icon: Banknote,
+          description: 'Contar billetes y monedas (CRC/USD)'
+        },
+        { id: 'timingcontrol' as ActiveTab, name: 'Control Tiempos', icon: Smartphone, description: 'Registro de venta de tiempos' },
+        { id: 'controlhorario' as ActiveTab, name: 'Control Horario', icon: Clock, description: 'Registro de horarios de trabajo' },
+        { id: 'supplierorders' as ActiveTab, name: 'Órdenes Proveedor', icon: Truck, description: 'Gestión de órdenes de proveedores' },
+        { id: 'scanhistory' as ActiveTab, name: 'Historial de Escaneos', icon: History, description: 'Ver historial completo de escaneos' },
+        { id: 'edit' as ActiveTab, name: 'Mantenimiento', icon: Settings, description: 'Gestión y mantenimiento del sistema' },
+      ];
+      return tabs.find(t => t.id === tabId);
+    };
+  */
   // LocalStorage: load on mount
   useEffect(() => {
     const stored = localStorage.getItem('scanHistory')
@@ -254,7 +243,8 @@ export default function HomePage() {
           <ClientOnlyHomeMenu />
         ) : (
           <>
-            {/* Page title for active tab */}
+            {/*TODO: DESCOMENTAR LO SIGUIENTE SI SE QUIERE LAS DESCRIPCIONES EN LAS PESTAÑAS */}
+            {/* Page title for active tab 
             <div className="mb-6 text-center">
               <h2 className="text-2xl font-bold mb-2">
                 {getTabInfo(activeTab)?.name}
@@ -262,7 +252,7 @@ export default function HomePage() {
               <p className="text-[var(--tab-text)]">
                 {getTabInfo(activeTab)?.description}
               </p>
-            </div>
+            </div>*/}
 
             {/* Contenido de las pestañas */}
             <div className="space-y-8">
@@ -300,21 +290,17 @@ export default function HomePage() {
 
               {/* CONVERTER */}
               {activeTab === 'converter' && (
-                <div className="max-w-6xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-4">
-                  <TextConversion />
-                </div>
+                <TextConversion />
               )}
 
               {/* CASHCOUNTER (Contador Efectivo) */}
               {activeTab === 'cashcounter' && (
-                <div className="max-w-6xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-4">
-                  <CashCounterTabs />
-                </div>
+                <CashCounterTabs />
               )}
 
               {/* CONTROL TIEMPOS */}
               {activeTab === 'timingcontrol' && (
-                <div className="max-w-4xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-4 min-h-[300px] flex flex-col items-center justify-center">
+                <div className="max-w-7xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-6">
                   <TimingControl />
                 </div>
               )}
@@ -326,16 +312,12 @@ export default function HomePage() {
 
               {/* SUPPLIER ORDERS */}
               {activeTab === 'supplierorders' && (
-                <div className="max-w-6xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-4">
-                  <SupplierOrders />
-                </div>
+                <SupplierOrders />
               )}
 
               {/* HISTORIAL DE ESCANEOS */}
               {activeTab === 'scanhistory' && (
-                <div className="max-w-6xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-4">
-                  <ScanHistoryTable />
-                </div>
+                <ScanHistoryTable />
               )}
 
               {/* EDIT / MANTENIMIENTO */}

@@ -14,7 +14,7 @@ export function useScanHistory() {
     try {
       const codes = scans.map(scan => scan.code);
       const imageStatusMap = await ScanningService.checkMultipleCodesHaveImages(codes);
-      
+
       return scans.map(scan => ({
         ...scan,
         hasImages: imageStatusMap.get(scan.code) || false
@@ -31,17 +31,17 @@ export function useScanHistory() {
     try {
       setLoading(true);
       setError(null);
-      
+
       const scans = await ScanningService.getAllScans();
-      // Filtrar DELIFOOD_TEST desde el inicio
-      const filteredScans = scans.filter(scan => scan.location !== 'DELIFOOD_TEST');
-      
+  // Filtrar DELIFOOD_TEST desde el inicio (ownercompanie)
+  const filteredScans = scans.filter(scan => scan.ownercompanie !== 'DELIFOOD_TEST');
+
       // Check which codes have images (optimized batch operation)
       const scansWithImageInfo = await checkCodesHaveImages(filteredScans);
-      
+
       // Ordenar por timestamp descendente (más recientes primero)
       scansWithImageInfo.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-      
+
       setScanHistory(scansWithImageInfo);
     } catch (error) {
       console.error('Error loading scan history:', error);
@@ -56,40 +56,40 @@ export function useScanHistory() {
     try {
       setLoading(true);
       setError(null);
-      
+
       // Forzar actualización de caché
       ScanningService.forceRefreshCache();
-      
+
       const scans = await ScanningService.getAllScans();
-      // Filtrar DELIFOOD_TEST al actualizar
-      const filteredScans = scans.filter(scan => scan.location !== 'DELIFOOD_TEST');
-      
+  // Filtrar DELIFOOD_TEST al actualizar (ownercompanie)
+  const filteredScans = scans.filter(scan => scan.ownercompanie !== 'DELIFOOD_TEST');
+
       // Obtener códigos existentes para comparar
       const existingCodes = new Set(scanHistory.map(scan => scan.code));
-      
+
       // Identificar códigos nuevos que necesitan verificación de imágenes
       const newScans = filteredScans.filter(scan => !existingCodes.has(scan.code));
       const existingScans = filteredScans.filter(scan => existingCodes.has(scan.code));
-      
+
       // Verificar imágenes solo para códigos nuevos (en batch)
-      const newScansWithImageStatus = newScans.length > 0 
+      const newScansWithImageStatus = newScans.length > 0
         ? await checkCodesHaveImages(newScans)
         : [];
-      
+
       // Mantener el estado de imágenes de los códigos existentes
       const existingScansWithCurrentImageStatus = existingScans.map(scan => {
         const existingScan = scanHistory.find(existing => existing.code === scan.code);
         return { ...scan, hasImages: existingScan?.hasImages || false };
       });
-      
+
       // Combinar todos los escaneos
       const allScansWithImageStatus = [...existingScansWithCurrentImageStatus, ...newScansWithImageStatus];
-      
+
       // Ordenar por timestamp descendente (más recientes primero)
       allScansWithImageStatus.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-      
+
       setScanHistory(allScansWithImageStatus);
-      
+
       return { newCount: newScans.length };
     } catch (error) {
       console.error('Error refreshing history:', error);
@@ -147,24 +147,30 @@ export function useScanImages() {
   const [codeImages, setCodeImages] = useState<string[]>([]);
   const [loadingImages, setLoadingImages] = useState(false);
   const [imageLoadError, setImageLoadError] = useState<string | null>(null);
+  const [codeBU, setCodeBU] = useState<string | null>(null);
 
   const loadImagesForCode = useCallback(async (barcodeCode: string) => {
     setLoadingImages(true);
     setImageLoadError(null);
-    
+
     try {
       const imageUrls = await ScanningService.getImagesForCode(barcodeCode);
-      
+
       setCodeImages(imageUrls);
-      
+
+      // Also try to load the codeBU metadata from any matching image
+      const codeBUMetadata = await ScanningService.getCodeBUForCode(barcodeCode);
+      setCodeBU(codeBUMetadata);
+
       if (imageUrls.length === 0) {
         setImageLoadError('No se encontraron imágenes para este código');
       }
-      
+
     } catch (error) {
       console.error('Error loading images:', error);
       setImageLoadError('Error al cargar las imágenes');
       setCodeImages([]);
+      setCodeBU(null);
     } finally {
       setLoadingImages(false);
     }
@@ -174,12 +180,14 @@ export function useScanImages() {
     setCodeImages([]);
     setImageLoadError(null);
     setLoadingImages(false);
+    setCodeBU(null);
   }, []);
 
   return {
     codeImages,
     loadingImages,
     imageLoadError,
+    codeBU,
     loadImagesForCode,
     clearImages
   };

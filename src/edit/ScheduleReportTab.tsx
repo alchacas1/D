@@ -3,9 +3,9 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { ChevronLeft, ChevronRight, Calendar, MapPin, FileText, Download } from 'lucide-react';
-import { LocationsService } from '../services/locations';
+import { EmpresasService } from '../services/empresas';
+import { useAuth } from '../hooks/useAuth';
 import { SchedulesService, ScheduleEntry } from '../services/schedules';
-import { Location } from '../types/firestore';
 
 interface BiweeklyPeriod {
   start: Date;
@@ -22,13 +22,27 @@ interface EmployeeSchedule {
 }
 
 interface LocationSchedule {
-  location: Location;
+  location: MappedEmpresa;
   employees: EmployeeSchedule[];
   totalWorkDays: number;
 }
 
+interface MappedEmpresa {
+  id?: string;
+  label: string;
+  value: string;
+  names: string[];
+  employees: {
+    name: string;
+    ccssType: 'TC' | 'MT';
+    hoursPerShift: number;
+    extraAmount: number;
+  }[];
+}
+
 export default function ScheduleReportTab() {
-  const [locations, setLocations] = useState<Location[]>([]);
+  const { user: currentUser } = useAuth();
+  const [locations, setLocations] = useState<MappedEmpresa[]>([]);
   const [selectedLocation, setSelectedLocation] = useState<string>('all');
   const [currentPeriod, setCurrentPeriod] = useState<BiweeklyPeriod | null>(null);
   const [availablePeriods, setAvailablePeriods] = useState<BiweeklyPeriod[]>([]);
@@ -113,18 +127,44 @@ export default function ScheduleReportTab() {
     }
   };
 
-  // Cargar ubicaciones
+  // Cargar empresas (mapeadas a la forma esperada por la vista de planilla)
   useEffect(() => {
     const loadLocations = async () => {
       try {
-        const locationsData = await LocationsService.getAllLocations();
-        setLocations(locationsData);
+        const empresas = await EmpresasService.getAllEmpresas();
+
+        let owned: typeof empresas = [];
+
+        if (!currentUser) {
+          owned = [];
+        } else if (currentUser.role === 'superadmin') {
+          owned = empresas || [];
+        } else {
+          owned = (empresas || []).filter(e => e && e.ownerId && (
+            String(e.ownerId) === String(currentUser.id) ||
+            (currentUser.ownerId && String(e.ownerId) === String(currentUser.ownerId))
+          ));
+        }
+
+        const mapped = owned.map(e => ({
+          id: e.id,
+          label: e.name || e.ubicacion || e.id || 'Empresa',
+          value: e.ubicacion || e.name || e.id || '',
+          names: [],
+          employees: (e.empleados || []).map(emp => ({
+            name: emp.Empleado || '',
+            ccssType: emp.ccssType || 'TC',
+            hoursPerShift: emp.hoursPerShift || 8,
+            extraAmount: emp.extraAmount || 0
+          }))
+        }));
+        setLocations(mapped);
       } catch (error) {
-        console.error('Error loading locations:', error);
+        console.error('Error loading empresas:', error);
       }
     };
     loadLocations();
-  }, []);
+  }, [currentUser]);
 
   // Inicializar períodos disponibles
   useEffect(() => {
@@ -146,7 +186,7 @@ export default function ScheduleReportTab() {
         setAvailablePeriods([current, ...available]);
       } else {
         setAvailablePeriods(available);
-      }      setLoading(false);
+      } setLoading(false);
     };
     initializePeriods();
   }, []);
@@ -176,10 +216,10 @@ export default function ScheduleReportTab() {
       const locationGroups = new Map<string, ScheduleEntry[]>();
 
       periodSchedules.forEach(schedule => {
-        if (!locationGroups.has(schedule.locationValue)) {
-          locationGroups.set(schedule.locationValue, []);
+        if (!locationGroups.has(schedule.companieValue)) {
+          locationGroups.set(schedule.companieValue, []);
         }
-        locationGroups.get(schedule.locationValue)!.push(schedule);
+        locationGroups.get(schedule.companieValue)!.push(schedule);
       });
 
       const scheduleDataArray: LocationSchedule[] = [];
@@ -237,7 +277,7 @@ export default function ScheduleReportTab() {
       setLoading(false);
     }
   }, [currentPeriod, selectedLocation, locations]);
-  
+
   // Cargar datos de horarios cuando cambie el período o la ubicación
   useEffect(() => {
     if (currentPeriod) {
@@ -334,18 +374,18 @@ export default function ScheduleReportTab() {
         </div>
       </div>
 
-      {/* Selector de ubicación */}
+      {/* Selector de empresa */}
       <div className="flex items-center gap-4">
         <label className="flex items-center gap-2 text-sm font-medium">
           <MapPin className="w-4 h-4" />
-          Ubicación:
+          Empresa:
         </label>
         <select
           value={selectedLocation}
           onChange={(e) => setSelectedLocation(e.target.value)}
           className="px-3 py-2 border border-[var(--input-border)] rounded-md bg-[var(--input-bg)] text-[var(--text-color)]"
         >
-          <option value="all">Todas las ubicaciones</option>
+          <option value="all">Todas las empresas</option>
           {locations.filter(location => location.value !== 'DELIFOOD').map(location => (<option key={location.value} value={location.value}>
             {location.label}
           </option>
@@ -436,9 +476,9 @@ export default function ScheduleReportTab() {
                         {getDaysInPeriod().map(day => (
                           <td key={day} className="text-center p-2">
                             <span className={`w-6 h-6 rounded text-xs font-medium flex items-center justify-center ${employee.days[day] === 'D' ? 'bg-yellow-200 text-yellow-800' :
-                                employee.days[day] === 'N' ? 'bg-blue-200 text-blue-800' :
-                                  employee.days[day] === 'L' ? 'bg-gray-200 text-gray-800' :
-                                    'bg-transparent'
+                              employee.days[day] === 'N' ? 'bg-blue-200 text-blue-800' :
+                                employee.days[day] === 'L' ? 'bg-gray-200 text-gray-800' :
+                                  'bg-transparent'
                               }`}>
                               {employee.days[day] || ''}
                             </span>

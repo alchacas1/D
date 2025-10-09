@@ -1,43 +1,10 @@
-import { LocationsService } from '../services/locations';
 import { SorteosService } from '../services/sorteos';
 import { UsersService } from '../services/users';
 import { CcssConfigService } from '../services/ccss-config';
-import { Location } from '../types/firestore';
-import locationsData from '../data/locations.json';
-import sorteosData from '../data/sorteos.json';
+import fs from 'fs';
+import path from 'path';
 
 export class MigrationService {
-
-  /**
-   * Migrate locations from JSON to Firestore
-   */
-  static async migrateLocations(): Promise<void> {
-    console.log('Starting locations migration...');
-
-    try {
-      // Check if locations already exist
-      const existingLocations = await LocationsService.getAllLocations();
-      if (existingLocations.length > 0) {
-        console.log(`Found ${existingLocations.length} existing locations. Skipping migration.`);
-        return;
-      }
-
-      // Migrate each location
-      for (const locationData of locationsData as Location[]) {
-        const locationId = await LocationsService.addLocation({
-          label: locationData.label,
-          value: locationData.value,
-          names: locationData.names
-        });
-        console.log(`Migrated location: ${locationData.label} (ID: ${locationId})`);
-      }
-
-      console.log(`Successfully migrated ${locationsData.length} locations to Firestore.`);
-    } catch (error) {
-      console.error('Error migrating locations:', error);
-      throw error;
-    }
-  }
 
   /**
    * Migrate sorteos from JSON to Firestore
@@ -46,6 +13,22 @@ export class MigrationService {
     console.log('Starting sorteos migration...');
 
     try {
+      // Load sorteos JSON at runtime if available to avoid build-time module resolution errors
+      const sorteosJsonPath = path.resolve(process.cwd(), 'src', 'data', 'sorteos.json');
+  let sorteosData: string[] = [];
+      if (fs.existsSync(sorteosJsonPath)) {
+        try {
+          const raw = fs.readFileSync(sorteosJsonPath, 'utf8');
+          sorteosData = JSON.parse(raw) as string[];
+        } catch (err) {
+          console.warn('Could not read or parse sorteos.json:', err);
+          sorteosData = [];
+        }
+      } else {
+        console.log('sorteos.json not found, skipping sorteos migration.');
+        return;
+      }
+
       // Check if sorteos already exist
       const existingSorteos = await SorteosService.getAllSorteos();
       if (existingSorteos.length > 0) {
@@ -71,12 +54,11 @@ export class MigrationService {
   /**
    * Run all migrations
    */
-  static async runAllMigrations(): Promise<void> {    console.log('Starting data migration from JSON to Firestore...');
+  static async runAllMigrations(): Promise<void> {
+    console.log('Starting data migration from JSON to Firestore...');
 
     try {
-      await this.migrateLocations();
       await this.migrateSorteos();
-      await CcssConfigService.initializeCcssConfig();
       console.log('All migrations completed successfully!');
     } catch (error) {
       console.error('Migration failed:', error);
@@ -90,15 +72,6 @@ export class MigrationService {
     console.log('WARNING: Clearing all Firestore data...');
 
     try {
-      // Clear locations
-      const locations = await LocationsService.getAllLocations();
-      for (const location of locations) {
-        if (location.id) {
-          await LocationsService.deleteLocation(location.id);
-        }
-      }
-      console.log(`Deleted ${locations.length} locations.`);
-
       // Clear sorteos
       const sorteos = await SorteosService.getAllSorteos();
       for (const sorteo of sorteos) {
@@ -119,10 +92,14 @@ export class MigrationService {
       try {
         // We don't delete the CCSS config, just reset it to default values
         await CcssConfigService.updateCcssConfig({
-          mt: 3672.46,
-          tc: 11017.39,
-          valorhora: 1441,
-          horabruta: 1529.62
+          ownerId: 'default',
+          companie: [{
+            ownerCompanie: 'default',
+            mt: 3672.46,
+            tc: 11017.39,
+            valorhora: 1441,
+            horabruta: 1529.62
+          }]
         });
         console.log('CCSS configuration reset to default values.');
       } catch (error) { // eslint-disable-line @typescript-eslint/no-unused-vars

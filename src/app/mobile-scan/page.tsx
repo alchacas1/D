@@ -1,13 +1,13 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, Suspense} from 'react';
+import React, { useState, useEffect, useCallback, Suspense } from 'react';
 import { QrCode, Smartphone, Check, AlertCircle, Camera, Image as ImageIcon, X, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
 import Image from 'next/image';
 import { ScanningService } from '../../services/scanning';
 import { useAuth } from '../../hooks/useAuth';
 import { useBarcodeScanner } from '../../hooks/useBarcodeScanner';
-import CameraScanner from '../../components/CameraScanner';
+import { CameraScanner } from '../../components/scanner';
 import { storage } from '../../config/firebase';
 import { ref, uploadBytes, getDownloadURL, listAll } from 'firebase/storage';
 
@@ -33,11 +33,11 @@ function MobileScanContent() {
   const { user } = useAuth();
   const searchParams = useSearchParams();
   // sessionId eliminado
-  const requestProductNameParam = searchParams?.get('requestProductName');
-  const rpnParam = searchParams?.get('rpn');
+  const requestProductNameParam = searchParams.get('requestProductName');
+  const rpnParam = searchParams.get('rpn');
 
   const [code, setCode] = useState('');
-  const [lastScanned, setLastScanned] = useState<{ code: string, productName?: string, location?: string, hasImages?: boolean }[]>([]);
+  const [lastScanned, setLastScanned] = useState<{ code: string, productName?: string, ownercompanie?: string, hasImages?: boolean }[]>([]);
   const [error, setError] = useState<string | null>(null);
   // Eliminado: const [isOnline, setIsOnline] = useState(true);
   const [isClient, setIsClient] = useState(false);
@@ -45,6 +45,10 @@ function MobileScanContent() {
   const [showNameModal, setShowNameModal] = useState(false);
   const [pendingCode, setPendingCode] = useState<string>(''); const [productName, setProductName] = useState('');
   const [uploadedImagesCount, setUploadedImagesCount] = useState(0);
+  // Numeric-only code extracted from photo (to be saved in DB as codeBU)
+  const [pendingCodeBU, setPendingCodeBU] = useState<string | null>(null);
+  // Flag to avoid showing codes detected from still images in the UI
+  const [isDecodingImage, setIsDecodingImage] = useState(false);
 
   // Estados para modal de imágenes
   const [showImagesModal, setShowImagesModal] = useState(false);
@@ -79,7 +83,6 @@ function MobileScanContent() {
     }
   }, [codeImages]);
 
-  // Estados para sincronización real
   const {
     code: detectedCode,
     error: scannerError,
@@ -88,9 +91,11 @@ function MobileScanContent() {
     toggleCamera, handleClear: clearScanner,
     handleCopyCode,
     detectionMethod,
-  } = useBarcodeScanner((detectedCode) => {
-    submitCode(detectedCode);
-  });// Check if we're on the client side
+  } = useBarcodeScanner((foundCode) => {
+    // Only submit codes detected by the main camera scanner
+    submitCode(foundCode);
+  });
+  // Check if we're on the client side
   useEffect(() => {
     setIsClient(true);
   }, []);
@@ -202,6 +207,7 @@ function MobileScanContent() {
 
         try {
           setError(null);
+          setIsDecodingImage(true);
 
           // Generate filename with consecutive number
           const baseFileName = codeToUse.trim();
@@ -212,8 +218,74 @@ function MobileScanContent() {
           // Create Firebase storage reference
           const storageRef = ref(storage, `barcode-images/${fileName}`);
 
+          // Try to detect a barcode inside the taken photo using an isolated detection
+          // This function is completely separate from the main scanner to avoid UI interference
+          const detectedFromPhoto: string | null = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = async (ev) => {
+              try {
+                const dataUrl = ev.target?.result as string;
+                
+                // Create isolated image processing without affecting main scanner state
+                const img = new window.Image();
+                img.crossOrigin = 'anonymous';
+                
+                img.onload = async () => {
+                  try {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    if (!ctx) {
+                      resolve(null);
+                      return;
+                    }
+                    
+                    canvas.width = img.naturalWidth;
+                    canvas.height = img.naturalHeight;
+                    ctx.drawImage(img, 0, 0);
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    
+                    // Use ZBar for isolated detection
+                    const { scanImageData } = await import('@undecaf/zbar-wasm');
+                    const symbols = await scanImageData(imageData);
+                    
+                    if (symbols && symbols.length > 0) {
+                      const code = symbols[0].decode();
+                      resolve(code || null);
+                    } else {
+                      resolve(null);
+                    }
+                  } catch {
+                    resolve(null);
+                  }
+                };
+                
+                img.onerror = () => resolve(null);
+                img.src = dataUrl;
+              } catch {
+                resolve(null);
+              }
+            };
+            
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(file);
+          });
+
+          // Only keep numeric-only value for codeBU, but ignore codes starting with "BASIC"
+          // Only update if there's no previous codeBU (first valid image wins)
+          const numericCodeBU = detectedFromPhoto && 
+            !detectedFromPhoto.startsWith('BASIC') && 
+            /^\d+$/.test(detectedFromPhoto)
+            ? detectedFromPhoto
+            : null;
+          if (numericCodeBU && !pendingCodeBU) {
+            setPendingCodeBU(numericCodeBU);
+          }
+
           // Upload file to Firebase Storage
-          await uploadBytes(storageRef, file);
+          await uploadBytes(storageRef, file, {
+            contentType: file.type,
+            ...(numericCodeBU ? { customMetadata: { codeBU: numericCodeBU } } : {})
+          });
 
           // Get download URL (optional, for verification)
           const downloadURL = await getDownloadURL(storageRef);
@@ -228,6 +300,9 @@ function MobileScanContent() {
         } catch (uploadError) {
           console.error('Error uploading image:', uploadError);
           setError('Error al subir la imagen. Inténtalo de nuevo.');
+        } finally {
+          // Clean state after image processing
+          setIsDecodingImage(false);
         }
       };
 
@@ -238,7 +313,7 @@ function MobileScanContent() {
       console.error('Error setting up camera capture:', error);
       setError('Error al acceder a la cámara');
     }
-  }, [pendingCode, code, uploadedImagesCount]);
+  }, [pendingCode, code, uploadedImagesCount, pendingCodeBU]);
 
   // Submit scanned code
   const submitCode = useCallback(async (scannedCode: string, nameForProduct?: string) => {
@@ -262,8 +337,8 @@ function MobileScanContent() {
       return;
     }
 
-    // Usar siempre la ubicación del usuario logado
-  const locationToSend = user && user.location ? user.location : undefined;
+    // Usar siempre la empresa asignada del usuario logado
+    const ownercompanieToSend = user?.ownercompanie ?? undefined;
 
     try {
       setError(null);
@@ -275,7 +350,8 @@ function MobileScanContent() {
         processed: false,
         // sessionId eliminado
         ...(nameForProduct?.trim() && { productName: nameForProduct.trim() }),
-        ...(locationToSend && { location: locationToSend })
+        ...(ownercompanieToSend && { ownercompanie: ownercompanieToSend }),
+        ...(pendingCodeBU && /^\d+$/.test(pendingCodeBU) && { codeBU: pendingCodeBU })
       };
 
       // Enviar al servicio de scanning y también a localStorage para sincronización con PC
@@ -289,8 +365,8 @@ function MobileScanContent() {
       if (nameForProduct?.trim()) {
         message += ` (${nameForProduct.trim()})`;
       }
-      if (locationToSend) {
-        message += ` [${locationToSend}]`;
+      if (ownercompanieToSend) {
+        message += ` [${ownercompanieToSend}]`;
       }
       message += ' enviado correctamente';
 
@@ -301,18 +377,19 @@ function MobileScanContent() {
       setLastScanned(prev => [...prev.slice(-4), {
         code: scannedCode,
         ...(nameForProduct?.trim() && { productName: nameForProduct.trim() }),
-        ...(locationToSend && { location: locationToSend }),
+        ...(ownercompanieToSend && { ownercompanie: ownercompanieToSend }),
         hasImages
       }]); // Keep last 5
       setCode('');
       setUploadedImagesCount(0); // Reset images count after successful submission
+      setPendingCodeBU(null); // Reset pending codeBU after submit
       // Clear success message after 2 seconds
       setTimeout(() => setSuccess(null), 2000);
     } catch (error) {
       console.error('Error submitting code:', error);
       setError('Error al enviar el código. Inténtalo de nuevo.');
     }
-  }, [lastScanned, requestProductName, user, checkCodeHasImages]);
+  }, [lastScanned, requestProductName, user, checkCodeHasImages, pendingCodeBU]);
   // Handler para eliminar primer dígito
   const handleRemoveLeadingZero = useCallback(() => {
     if (detectedCode && detectedCode.length > 1 && detectedCode[0] === '0') {
@@ -420,10 +497,10 @@ function MobileScanContent() {
         <div className="flex items-center gap-4"></div>
       </div>
       {/* Status Messages */}
-      {(error || scannerError) && (
+      {(error || (cameraActive && !isDecodingImage && scannerError)) && (
         <div className="bg-red-100 dark:bg-red-900/50 border border-red-300 dark:border-red-600 rounded-lg p-3 mb-4 flex items-center gap-2">
           <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400" />
-          <span className="text-red-800 dark:text-red-200">{error || scannerError}</span>
+          <span className="text-red-800 dark:text-red-200">{error || (cameraActive && !isDecodingImage ? scannerError : null)}</span>
         </div>
       )}
       {success && (
@@ -440,8 +517,8 @@ function MobileScanContent() {
           {/* Usar CameraScanner component */}
           {isClient && (
             <CameraScanner
-              code={detectedCode}
-              error={scannerError}
+              code={cameraActive && !isDecodingImage ? detectedCode : null}
+              error={cameraActive && !isDecodingImage ? scannerError : null}
               detectionMethod={detectionMethod}
               cameraActive={cameraActive}
               liveStreamRef={liveStreamRef}
@@ -534,7 +611,7 @@ function MobileScanContent() {
                 className="w-full bg-input-bg border border-input-border rounded-lg px-4 py-3 text-foreground placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-blue-500 mb-4"
                 autoFocus
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && (!requestProductName || productName.trim())) {
+                  if (e.key === 'Enter' && (!requestProductName || productName.trim()) && !isDecodingImage) {
                     handleNameSubmit();
                   } else if (e.key === 'Escape') {
                     handleNameCancel();
@@ -574,10 +651,10 @@ function MobileScanContent() {
                 </button>
                 <button
                   onClick={handleNameSubmit}
-                  disabled={requestProductName && !productName.trim()}
+                  disabled={(requestProductName && !productName.trim()) || isDecodingImage}
                   className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 dark:disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg text-white font-medium"
                 >
-                  Continuar
+                  Enviar
                 </button>
               </div>
             </div>

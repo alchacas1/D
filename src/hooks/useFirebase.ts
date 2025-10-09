@@ -1,91 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
-import { LocationsService } from '../services/locations';
 import { SorteosService } from '../services/sorteos';
 import { UsersService } from '../services/users';
 import { CcssConfigService } from '../services/ccss-config';
-import { Location, Sorteo, User, CcssConfig } from '../types/firestore';
+import { Sorteo, User, CcssConfig } from '../types/firestore';
+import { useAuth } from './useAuth';
 
 // Export the schedules hook
 export { useSchedules } from './useSchedules';
-
-export function useLocations() {
-  const [locations, setLocations] = useState<Location[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchLocations = useCallback(async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      const data = await LocationsService.getAllLocations();
-      setLocations(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error loading locations');
-      console.error('Error fetching locations:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const addLocation = useCallback(async (location: Omit<Location, 'id'>) => {
-    try {
-      setError(null);
-      const id = await LocationsService.addLocation(location);
-      await fetchLocations(); // Refresh list
-      return id;
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error adding location');
-      throw err;
-    }
-  }, [fetchLocations]);
-
-  const updateLocation = useCallback(async (id: string, location: Partial<Location>) => {
-    try {
-      setError(null);
-      await LocationsService.updateLocation(id, location);
-      await fetchLocations(); // Refresh list
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error updating location');
-      throw err;
-    }
-  }, [fetchLocations]);
-
-  const deleteLocation = useCallback(async (id: string) => {
-    try {
-      setError(null);
-      await LocationsService.deleteLocation(id);
-      await fetchLocations(); // Refresh list
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error deleting location');
-      throw err;
-    }
-  }, [fetchLocations]);
-
-  const searchLocationsByName = useCallback(async (name: string) => {
-    try {
-      setError(null);
-      return await LocationsService.findLocationsByName(name);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Error searching locations');
-      throw err;
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchLocations();
-  }, [fetchLocations]);
-
-  return {
-    locations,
-    loading,
-    error,
-    addLocation,
-    updateLocation,
-    deleteLocation,
-    searchLocationsByName,
-    refetch: fetchLocations
-  };
-}
 
 export function useSorteos() {
   const [sorteos, setSorteos] = useState<Sorteo[]>([]);
@@ -167,6 +88,7 @@ export function useSorteos() {
 }
 
 export function useUsers() {
+  const { user: currentUser } = useAuth();
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -175,7 +97,7 @@ export function useUsers() {
     try {
       setLoading(true);
       setError(null);
-      const data = await UsersService.getAllUsers();
+      const data = await UsersService.getAllUsersAs(currentUser);
       setUsers(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error loading users');
@@ -183,69 +105,70 @@ export function useUsers() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [currentUser]);
 
   const addUser = useCallback(async (user: Omit<User, 'id' | 'createdAt' | 'updatedAt'>) => {
     try {
       setError(null);
-      const id = await UsersService.addUser(user);
+  const id = await UsersService.createUserAs(currentUser, user);
       await fetchUsers(); // Refresh list
       return id;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error adding user');
       throw err;
     }
-  }, [fetchUsers]);
+  }, [fetchUsers, currentUser]);
 
   const updateUser = useCallback(async (id: string, user: Partial<User>) => {
     try {
       setError(null);
-      await UsersService.updateUser(id, user);
+  await UsersService.updateUserAs(currentUser, id, user);
       await fetchUsers(); // Refresh list
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error updating user');
       throw err;
     }
-  }, [fetchUsers]);
+  }, [fetchUsers, currentUser]);
 
   const deleteUser = useCallback(async (id: string) => {
     try {
       setError(null);
-      await UsersService.deleteUser(id);
+  await UsersService.deleteUserAs(currentUser, id);
       await fetchUsers(); // Refresh list
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error deleting user');
       throw err;
     }
-  }, [fetchUsers]);
+  }, [fetchUsers, currentUser]);
 
   const searchUsers = useCallback(async (searchTerm: string) => {
     try {
       setError(null);
-      return await UsersService.searchUsers(searchTerm);
+      return await UsersService.searchUsersAs(currentUser, searchTerm);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error searching users');
       throw err;
     }
-  }, []); const getUsersByRole = useCallback(async (role: 'admin' | 'user' | 'superadmin') => {
+  }, [currentUser]);
+
+  const getUsersByRole = useCallback(async (role: 'admin' | 'user' | 'superadmin') => {
     try {
       setError(null);
-      return await UsersService.findUsersByRole(role);
+      return await UsersService.findUsersByRole(currentUser, role);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error getting users by role');
       throw err;
     }
-  }, []);
-
+  }, [currentUser]);
   const getActiveUsers = useCallback(async () => {
     try {
       setError(null);
-      return await UsersService.getActiveUsers();
+      return await UsersService.getActiveUsersAs(currentUser);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error getting active users');
       throw err;
     }
-  }, []);
+  }, [currentUser]);
 
   useEffect(() => {
     fetchUsers();
@@ -266,7 +189,16 @@ export function useUsers() {
 }
 
 export function useCcssConfig() {
-  const [ccssConfig, setCcssConfig] = useState<CcssConfig>({ mt: 3672.46, tc: 11017.39, valorhora: 1441, horabruta: 1529.62 });
+  const [ccssConfig, setCcssConfig] = useState<CcssConfig>({ 
+    ownerId: '', 
+    companie: [{ 
+      ownerCompanie: '', 
+      mt: 3672.46, 
+      tc: 11017.39, 
+      valorhora: 1441, 
+      horabruta: 1529.62 
+    }] 
+  });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -274,8 +206,12 @@ export function useCcssConfig() {
     try {
       setLoading(true);
       setError(null);
-      const data = await CcssConfigService.getCcssConfig();
-      setCcssConfig(data);
+      // Este hook necesita un ownerId - se debería refactorizar para recibirlo como parámetro
+      // Por ahora usamos un valor por defecto
+      const data = await CcssConfigService.getCcssConfig('default');
+      if (data) {
+        setCcssConfig(data);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error loading CCSS config');
       console.error('Error fetching CCSS config:', err);
@@ -309,23 +245,20 @@ export function useCcssConfig() {
 }
 
 export function useFirebaseData() {
-  const locationsHook = useLocations();
   const sorteosHook = useSorteos();
   const usersHook = useUsers();
   const ccssConfigHook = useCcssConfig();
 
-  const loading = locationsHook.loading || sorteosHook.loading || usersHook.loading || ccssConfigHook.loading;
-  const error = locationsHook.error || sorteosHook.error || usersHook.error || ccssConfigHook.error;
+  const loading = sorteosHook.loading || usersHook.loading || ccssConfigHook.loading;
+  const error = sorteosHook.error || usersHook.error || ccssConfigHook.error;
 
   return {
-    locations: locationsHook,
     sorteos: sorteosHook,
     users: usersHook,
     ccssConfig: ccssConfigHook,
     loading,
     error,
     refetchAll: () => {
-      locationsHook.refetch();
       sorteosHook.refetch();
       usersHook.refetch();
       ccssConfigHook.refetch();

@@ -11,12 +11,6 @@ export default function ShortMobileScanPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!params) {
-      setError('Parámetros no encontrados');
-      setIsDecoding(false);
-      return;
-    }
-    
     const code = params.code as string;
     
     if (!code) {
@@ -52,7 +46,7 @@ export default function ShortMobileScanPage() {
       setError('Error al decodificar la URL. Puede estar corrupta o ser inválida.');
       setIsDecoding(false);
     }
-  }, [params, router]);
+  }, [params.code, router]);
 
   if (isDecoding) {
     return (

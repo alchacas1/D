@@ -1,16 +1,16 @@
-export interface Location {
-  id?: string;
-  label: string;
-  value: string;
-  names: string[];
-  employees?: Employee[]; // Nueva estructura para empleados con tipo CCSS
+export interface EmpresaEmpleado {
+  Empleado: string;
+  hoursPerShift: number;
+  extraAmount: number;
+  ccssType: 'TC' | 'MT';
 }
 
-export interface Employee {
+export interface Empresas {
+  id?: string;
+  ownerId: string;
   name: string;
-  ccssType: 'TC' | 'MT'; // TC = Tiempo Completo, MT = Medio Tiempo
-  extraAmount?: number; // Monto extra, valor inicial 0
-  hoursPerShift?: number; // Horas por turno, valor predeterminado 8
+  ubicacion: string;
+  empleados: EmpresaEmpleado[];
 }
 
 export interface Sorteo {
@@ -27,16 +27,27 @@ export interface UserPermissions {
   supplierorders: boolean; // Órdenes Proveedor - Gestión de órdenes de proveedores
   mantenimiento: boolean;  // Mantenimiento - Nueva sección de mantenimiento
   scanhistory: boolean;    // Historial General de Escaneos - Ver historial completo de escaneos
-  scanhistoryLocations?: string[]; // Locaciones específicas para historial de escaneos
+  scanhistoryEmpresas?: string[]; // Empresas específicas para historial de escaneos (almacena company names)
 }
 
 export interface User {
   id?: string;
   name: string;
-  location?: string;
+  // correo electrónico del usuario
+  email?: string;
+  // nombre completo de la persona encargada (para admins)
+  fullName?: string;
+  // máximo de empresas que un admin puede manejar simultáneamente
+  maxCompanies?: number;
   password?: string;
+  // si el usuario pertenece a un owner (para multi-tenant)
+  ownerId?: string;
+  // Nombre de la empresa dueña asignada (espacio ownercompanie)
+  ownercompanie?: string;
   role?: 'admin' | 'user' | 'superadmin';
   isActive?: boolean;
+  // Campo para marcar eliminación lógica; por defecto false
+  eliminate?: boolean;
   permissions?: UserPermissions;
   createdAt?: Date;
   updatedAt?: Date;
@@ -44,7 +55,7 @@ export interface User {
 
 export interface ScheduleEntry {
   id?: string;
-  locationValue: string;
+  companieValue: string;
   employeeName: string;
   year: number;
   month: number;
@@ -65,15 +76,21 @@ export interface ScanResult {
   sessionId?: string;
   processedAt?: Date;
   productName?: string; // Optional product name for scanned codes
-  location?: string; // Selected location from mobile scanning
+  ownercompanie?: string; // Owner company name/identifier assigned from mobile scanning
   hasImages?: boolean; // Indicates if the code has associated images
+  codeBU?: string; // Numeric-only code extracted from photo (if available)
 }
 
 export interface CcssConfig {
   id?: string;
+  ownerId: string; // ID del propietario de la configuración
+  companie: companies[]; // Nombre de la empresa propietaria
+  updatedAt?: Date;
+}
+export interface companies {
+  ownerCompanie: string; // Nombre de la empresa propietaria
   mt: number; // Valor para Medio Tiempo
   tc: number; // Valor para Tiempo Completo
   valorhora: number; // Valor por hora predeterminado
   horabruta: number; // Valor por hora bruta
-  updatedAt?: Date;
 }
