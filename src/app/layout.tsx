@@ -1,6 +1,7 @@
 // app/layout.tsx 
 import './globals.css';
-import { ThemeProvider, HeaderWrapper, Footer } from '../components/layout';
+import { ThemeProvider, HeaderWrapper, Footer, PermissionsManager } from '../components/layout';
+import { ToastProvider } from '../components/ui/ToastProvider';
 import { AuthWrapper } from '../components/auth';
 
 export const metadata = {
@@ -62,13 +63,17 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="bg-background text-foreground transition-colors duration-500 min-h-screen flex flex-col" suppressHydrationWarning>
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
           <AuthWrapper>
-            <HeaderWrapper />
-            <main className="flex-1 flex flex-col w-full">
-              <div className="w-full" suppressHydrationWarning>
-                {children}
-              </div>
-            </main>
-            <Footer />
+            <PermissionsManager>
+              <ToastProvider>
+                <HeaderWrapper />
+                <main className="flex-1 flex flex-col w-full">
+                  <div className="w-full" suppressHydrationWarning>
+                    {children}
+                  </div>
+                </main>
+                <Footer />
+              </ToastProvider>
+            </PermissionsManager>
           </AuthWrapper>
         </ThemeProvider>
       </body>

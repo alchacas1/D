@@ -7,6 +7,7 @@ import { PriceCalculator, TextConversion } from '@/components/calculator'
 import { ScanHistory } from '@/components/scanner'
 import { CashCounterTabs, ControlHorario, TimingControl, SupplierOrders } from '@/components/business'
 import { useAuth } from '@/hooks/useAuth'
+import useToast from '@/hooks/useToast';
 /*import { Calculator, Smartphone, Type, Banknote, Scan, Clock, Truck, Settings, History, } from lucide-react'*/
 import type { ScanHistoryEntry } from '@/types/barcode'
 import { ClientOnlyHomeMenu } from '@/components/layout'
@@ -15,8 +16,10 @@ import { ScanHistoryTable } from '@/components/scanner'
 import { storage } from '@/config/firebase'
 import { ref, listAll } from 'firebase/storage'
 
-// 1) Ampliamos ActiveTab para incluir "cashcounter", "controlhorario", "supplierorders", "edit", "scanhistory"
-type ActiveTab = 'scanner' | 'calculator' | 'converter' | 'cashcounter' | 'timingcontrol' | 'controlhorario' | 'supplierorders' | 'scanhistory' | 'edit'
+// 1) Ampliamos ActiveTab para incluir "cashcounter", "controlhorario", "supplierorders", "edit", "scanhistory", "solicitud"
+type ActiveTab = 'scanner' | 'calculator' | 'converter' | 'cashcounter' | 'timingcontrol' | 'controlhorario' | 'supplierorders' | 'scanhistory' | 'edit' | 'solicitud' | 'fondogeneral'
+import FondoGeneralPage from '@/app/fondogeneral/page';
+import SolicitudForm from '@/components/solicitud/SolicitudForm'
 
 export default function HomePage() {
   // Hook para obtener el usuario autenticado
@@ -25,8 +28,13 @@ export default function HomePage() {
   // 2) Estado para la pestaña activa - now managed by URL hash only
   const [activeTab, setActiveTab] = useState<ActiveTab | null>(null);
   const [scanHistory, setScanHistory] = useState<ScanHistoryEntry[]>([])
-  const [notification, setNotification] = useState<{ message: string; color: string } | null>(null);
+  const { showToast } = useToast();
 
+  // Memoize notify so callbacks can depend on a stable reference
+  const notify = useCallback((message: string, color: string = 'green') => {
+    const type = color === 'green' ? 'success' : color === 'red' ? 'error' : 'info';
+    showToast(message, type);
+  }, [showToast]);
   // Helper function to get tab info
   {/*TODO: DESCOMENTAR LO SIGUIENTE SI SE QUIERE LAS DESCRIPCIONES EN LAS PESTAÑAS */ }
   /*
@@ -100,11 +108,8 @@ export default function HomePage() {
     })
   }, [checkCodeHasImages])
 
-  // Helper to show notification
-  const showNotification = (message: string, color: string = 'green') => {
-    setNotification({ message, color });
-    setTimeout(() => setNotification(null), 2000);
-  }
+  // Use global toast
+  
   // Handler: copiar
   const handleCopy = async (code: string) => {
     try {
@@ -124,16 +129,16 @@ export default function HomePage() {
         document.execCommand('copy');
         document.body.removeChild(textArea);
       }
-      showNotification('¡Código copiado!', 'green');
+  notify('¡Código copiado!', 'green');
     } catch (error) {
       console.error('Error copying to clipboard:', error);
-      showNotification('Error al copiar código', 'red');
+  notify('Error al copiar código', 'red');
     }
   }
   // Handler: eliminar
   const handleDelete = (code: string) => {
     setScanHistory(prev => prev.filter(e => e.code !== code));
-    showNotification('Código eliminado', 'red');
+  notify('Código eliminado', 'red');
   }
   // Handler: eliminar primer dígito
   const handleRemoveLeadingZero = (code: string) => {
@@ -142,20 +147,20 @@ export default function HomePage() {
         ? { ...e, code: code.slice(1) }
         : e
     ));
-    showNotification('Primer dígito eliminado', 'blue');
+  notify('Primer dígito eliminado', 'blue');
   }
   // Handler: renombrar
   const handleRename = (code: string, name: string) => {
     setScanHistory(prev => prev.map(e =>
       e.code === code ? { ...e, name } : e
     ));
-    showNotification('Nombre actualizado', 'indigo');
+  notify('Nombre actualizado', 'indigo');
   }
 
   // Handler: mostrar imágenes
   const handleShowImages = useCallback((code: string) => {
-    showNotification(`Mostrando imágenes de: ${code}`, 'purple');
-  }, []);
+    notify(`Mostrando imágenes de: ${code}`, 'purple');
+  }, [notify]);
 
   // Effect to check if existing codes in history have images
   useEffect(() => {
@@ -191,7 +196,7 @@ export default function HomePage() {
       if (typeof window !== 'undefined') {
         const hash = window.location.hash.replace('#', '') as ActiveTab;
         const validTabs = [
-          'scanner', 'calculator', 'converter', 'cashcounter', 'timingcontrol', 'controlhorario', 'supplierorders', 'scanhistory'
+          'scanner', 'calculator', 'converter', 'cashcounter', 'timingcontrol', 'controlhorario', 'supplierorders', 'scanhistory', 'solicitud', 'fondogeneral'
         ];
         if (validTabs.includes(hash)) {
           setActiveTab(hash);
@@ -214,7 +219,7 @@ export default function HomePage() {
       const handleHashChange = () => {
         const hash = window.location.hash.replace('#', '') as ActiveTab;
         const validTabs = [
-          'scanner', 'calculator', 'converter', 'cashcounter', 'timingcontrol', 'controlhorario', 'supplierorders', 'scanhistory', 'edit'
+          'scanner', 'calculator', 'converter', 'cashcounter', 'timingcontrol', 'controlhorario', 'supplierorders', 'scanhistory', 'edit', 'solicitud', 'fondogeneral'
         ];
         if (validTabs.includes(hash)) {
           setActiveTab(hash);
@@ -231,14 +236,7 @@ export default function HomePage() {
   return (
     <>
       <main className="flex-1 max-w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {notification && (
-          <div
-            className={`fixed top-6 right-6 z-50 px-6 py-3 rounded-xl shadow-2xl flex items-center gap-2 font-semibold animate-fade-in-down bg-${notification.color}-500 text-white`}
-            style={{ minWidth: 180, textAlign: 'center' }}
-          >
-            {notification.message}
-          </div>
-        )}
+        {/* notifications are rendered globally by ToastProvider */}
         {activeTab === null ? (
           <ClientOnlyHomeMenu />
         ) : (
@@ -275,7 +273,7 @@ export default function HomePage() {
                           onRemoveLeadingZero={handleRemoveLeadingZero}
                           onRename={handleRename}
                           onShowImages={handleShowImages}
-                          notify={showNotification}
+                          notify={notify}
                         />
                       </div>
                     </div>
@@ -318,6 +316,16 @@ export default function HomePage() {
               {/* HISTORIAL DE ESCANEOS */}
               {activeTab === 'scanhistory' && (
                 <ScanHistoryTable />
+              )}
+
+              {/* FONDO GENERAL */}
+              {activeTab === 'fondogeneral' && (
+                <FondoGeneralPage />
+              )}
+
+              {/* SOLICITUD */}
+              {activeTab === 'solicitud' && (
+                <SolicitudForm />
               )}
 
               {/* EDIT / MANTENIMIENTO */}

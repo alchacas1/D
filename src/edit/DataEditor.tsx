@@ -2,14 +2,15 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Save, Download, AlertCircle, Check, FileText, Users, Clock, DollarSign, Eye, EyeOff, Settings } from 'lucide-react';
+import useToast from '../hooks/useToast';
+import { Save, Download, FileText, Users, Clock, DollarSign, Eye, EyeOff, Settings } from 'lucide-react';
 import { EmpresasService } from '../services/empresas';
 import { SorteosService } from '../services/sorteos';
 import { UsersService } from '../services/users';
 import { useAuth } from '../hooks/useAuth';
 import { CcssConfigService } from '../services/ccss-config';
 import { Sorteo, User, CcssConfig, UserPermissions, companies } from '../types/firestore';
-import { getDefaultPermissions, getNoPermissions } from '../utils/permissions';
+import { getDefaultPermissions, getNoPermissions, hasPermission } from '../utils/permissions';
 import ScheduleReportTab from '../components/business/ScheduleReportTab';
 import ConfirmModal from '../components/ui/ConfirmModal';
 import ExportModal from '../components/export/ExportModal';
@@ -29,11 +30,7 @@ export default function DataEditor() {
     const [originalCcssConfigsData, setOriginalCcssConfigsData] = useState<CcssConfig[]>([]);
     const [hasChanges, setHasChanges] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
-    const [notification, setNotification] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
-    const showNotification = (message: string, type: 'success' | 'error' | 'info') => {
-        setNotification({ message, type });
-        setTimeout(() => setNotification(null), 3000);
-    };
+    const { showToast } = useToast();
     // Resolve ownerId for created entities: prefer explicit provided value, then
     // currentUser.ownerId (when admin has an assigned owner), then try session
     // stored in localStorage, then fall back to currentUser.id when actor is
@@ -103,7 +100,7 @@ export default function DataEditor() {
             } catch (error: unknown) {
                 console.error('Error in confirm action:', error);
                 const msg = error instanceof Error ? error.message : String(error || 'Error');
-                showNotification(msg.includes('Forbidden') ? 'No tienes permisos para realizar esta acción' : 'Error al ejecutar la acción', 'error');
+                showToast(msg.includes('Forbidden') ? 'No tienes permisos para realizar esta acción' : 'Error al ejecutar la acción', 'error');
             } finally {
                 closeConfirmModal();
             }
@@ -125,10 +122,83 @@ export default function DataEditor() {
             setOriginalSorteosData(JSON.parse(JSON.stringify(sorteos)));
 
             // Cargar empresas desde Firebase
+            // hoist a variable so later user-filtering can re-use the fetched empresas
+            let empresasToShow: any[] = [];
             try {
                 const empresas = await EmpresasService.getAllEmpresas();
-                setEmpresasData(empresas);
-                setOriginalEmpresasData(JSON.parse(JSON.stringify(empresas)));
+
+                // Si el actor autenticado tiene permiso de mantenimiento, solo mostrar
+                // las empresas cuyo ownerId coincide con el ownerId/resolved del actor.
+                empresasToShow = empresas;
+                try {
+                    if (currentUser && hasPermission(currentUser.permissions, 'mantenimiento')) {
+                        const actorOwnerId = resolveOwnerIdForActor();
+                        // Si se pudo resolver ownerId del actor, filtrar por ese ownerId.
+                        if (actorOwnerId) {
+                            empresasToShow = (empresas || []).filter((e: any) => e && e.ownerId === actorOwnerId);
+                        } else {
+                            // Fallback: usar currentUser.id or currentUser.ownerId if present
+                            empresasToShow = (empresas || []).filter((e: any) => e && (e.ownerId === currentUser.id || e.ownerId === currentUser.ownerId));
+                        }
+
+                        // Additionally ensure admins see companies they created (ownerId === currentUser.id)
+                        if (currentUser.role === 'admin') {
+                            try {
+                                const allowed = new Set<string>();
+                                if (currentUser.id) allowed.add(String(currentUser.id));
+                                if (currentUser.ownerId) allowed.add(String(currentUser.ownerId));
+                                try {
+                                    if (typeof window !== 'undefined') {
+                                        const sessionRaw = localStorage.getItem('pricemaster_session');
+                                        if (sessionRaw) {
+                                            const session = JSON.parse(sessionRaw);
+                                            if (session && session.ownerId) allowed.add(String(session.ownerId));
+                                        }
+                                    }
+                                } catch {}
+
+                                // merge: include any empresas whose ownerId is in allowed
+                                empresasToShow = (empresas || []).filter((e: any) => e && allowed.has(String(e.ownerId)));
+                            } catch (err) {
+                                console.warn('Error ensuring admin-owned empresas visible:', err);
+                            }
+                        }
+                    }
+                } catch (err) {
+                    // Si ocurre algún error durante el filtrado, dejar las empresas tal cual
+                    console.warn('Error filtrando empresas por ownerId:', err);
+                    empresasToShow = empresas;
+                }
+
+                // Additionally, if the current actor is an admin, exclude empresas
+                // that belong to a superadmin (i.e., empresas whose ownerId user.role === 'superadmin')
+                try {
+                    if (currentUser?.role === 'admin') {
+                        const ownerIds = Array.from(new Set((empresasToShow || []).map((e: any) => e.ownerId).filter(Boolean)));
+                        const owners = await Promise.all(ownerIds.map(id => UsersService.getUserById(id)));
+                        const ownerRoleById = new Map<string, string | undefined>();
+                        ownerIds.forEach((id, idx) => ownerRoleById.set(id, owners[idx]?.role));
+
+                        // Debug info to help diagnose missing empresas
+                        console.debug('[DataEditor] currentUser:', currentUser?.id, currentUser?.ownerId, 'resolved actorOwnerId:', resolveOwnerIdForActor());
+                        console.debug('[DataEditor] empresas fetched:', (empresas || []).length, 'ownerIds:', ownerIds);
+                        console.debug('[DataEditor] owner roles:', Array.from(ownerRoleById.entries()));
+
+                        empresasToShow = (empresasToShow || []).filter((e: any) => {
+                            const ownerRole = ownerRoleById.get(e.ownerId);
+                            // if owner is superadmin, hide from admin actors
+                            if (ownerRole === 'superadmin') return false;
+                            return true;
+                        });
+
+                        console.debug('[DataEditor] empresas after filtering:', empresasToShow.map((x: any) => ({ id: x.id, ownerId: x.ownerId, name: x.name })));
+                    }
+                } catch (err) {
+                    console.warn('Error resolving empresa owners while filtering superadmin-owned empresas:', err);
+                }
+
+                setEmpresasData(empresasToShow);
+                setOriginalEmpresasData(JSON.parse(JSON.stringify(empresasToShow)));
             } catch (err) {
                 console.warn('No se pudo cargar empresas:', err);
                 setEmpresasData([]);
@@ -146,8 +216,65 @@ export default function DataEditor() {
                     console.warn('Error ensuring all permissions:', error);
                 }
 
-                setUsersData(users);
-                setOriginalUsersData(JSON.parse(JSON.stringify(users)));
+                // Filtrar usuarios para que actores no-superadmin solo vean usuarios
+                // que compartan el mismo ownerId/resolved owner del actor.
+                let usersToShow = users;
+                try {
+                    if (currentUser.role !== 'superadmin') {
+                        // Construir un conjunto de ownerIds permitidos basados en el actor:
+                        // - currentUser.id (si el admin actúa en su propio id)
+                        // - currentUser.ownerId (cuando es delegado)
+                        // - session.ownerId si existe en localStorage
+                        const allowed = new Set<string>();
+                        if (currentUser.id) allowed.add(String(currentUser.id));
+                        if (currentUser.ownerId) allowed.add(String(currentUser.ownerId));
+
+                        try {
+                            if (typeof window !== 'undefined') {
+                                const sessionRaw = localStorage.getItem('pricemaster_session');
+                                if (sessionRaw) {
+                                    const session = JSON.parse(sessionRaw);
+                                    if (session && session.ownerId) allowed.add(String(session.ownerId));
+                                }
+                            }
+                        } catch {}
+
+                        // Si el actor tiene eliminate === false, su id debe permitirse también
+                        if (currentUser.eliminate === false && currentUser.id) allowed.add(String(currentUser.id));
+
+                        usersToShow = (users || []).filter(u => {
+                            if (!u) return false;
+                            // siempre mostrar al propio actor
+                            if (u.id && currentUser.id && String(u.id) === String(currentUser.id)) return true;
+                            if (u.ownerId && allowed.has(String(u.ownerId))) return true;
+                            return false;
+                        });
+                    }
+                } catch (err) {
+                    console.warn('Error filtering users by ownerId:', err);
+                    usersToShow = users;
+                }
+
+                setUsersData(usersToShow);
+                setOriginalUsersData(JSON.parse(JSON.stringify(usersToShow)));
+
+                // Re-apply empresa filtering so admins see empresas owned by users they can see.
+                try {
+                    if (currentUser && currentUser.role !== 'superadmin') {
+                        const visibleOwnerIds = (usersToShow || []).map(u => u.id).filter(Boolean).map(String);
+                        if (visibleOwnerIds.length > 0) {
+                            // Use the empresas we just fetched/filtered earlier in this function
+                            const filteredEmpresas = (empresasToShow || []).filter(e => e && e.ownerId && visibleOwnerIds.includes(String(e.ownerId)));
+                            // Only set if we have results; otherwise keep current empresasData (avoid hiding unintentionally)
+                            if (filteredEmpresas.length > 0) {
+                                setEmpresasData(filteredEmpresas);
+                                setOriginalEmpresasData(JSON.parse(JSON.stringify(filteredEmpresas)));
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.warn('Error re-filtering empresas based on visible users:', err);
+                }
             } else {
                 // Si no hay currentUser (por ejemplo durante SSR/hydration temprana), inicializar vacíos
                 setUsersData([]);
@@ -166,10 +293,10 @@ export default function DataEditor() {
             }
 
         } catch (error) {
-            showNotification('Error al cargar los datos de Firebase', 'error');
+            showToast('Error al cargar los datos de Firebase', 'error');
             console.error('Error loading data from Firebase:', error);
         }
-    }, [currentUser, resolveOwnerIdForActor]);
+    }, [currentUser, resolveOwnerIdForActor, showToast]);
 
     // Cargar datos al montar el componente o cuando cambie el usuario autenticado
     useEffect(() => {
@@ -270,10 +397,10 @@ export default function DataEditor() {
             setOriginalEmpresasData(JSON.parse(JSON.stringify(empresasData)));
 
             setHasChanges(false);
-            showNotification('¡Datos actualizados exitosamente en Firebase!', 'success');
+            showToast('¡Datos actualizados exitosamente en Firebase!', 'success');
         } catch (error) {
             console.error('Error saving data to Firebase:', error);
-            showNotification('Error al guardar los datos en Firebase', 'error');
+            showToast('Error al guardar los datos en Firebase', 'error');
         } finally {
             setIsSaving(false);
         }
@@ -372,11 +499,11 @@ export default function DataEditor() {
                     // Actualizar originalUsersData para eliminarlo también
                     setOriginalUsersData(prev => prev.filter(u => u.id !== user.id && (u as unknown as { __localId?: string }).__localId !== (user as unknown as { __localId?: string }).__localId));
 
-                    showNotification(`Usuario ${userName} eliminado exitosamente`, 'success');
+                    showToast(`Usuario ${userName} eliminado exitosamente`, 'success');
                 } catch (error: unknown) {
                     console.error('Error deleting user:', error);
                     const msg = error instanceof Error ? error.message : String(error || 'Error al eliminar el usuario');
-                    showNotification(msg.includes('Forbidden') ? 'No tienes permisos para eliminar este usuario' : 'Error al eliminar el usuario', 'error');
+                    showToast(msg.includes('Forbidden') ? 'No tienes permisos para eliminar este usuario' : 'Error al eliminar el usuario', 'error');
                 } finally {
                     // Cerrar modal y quitar loading
                     closeConfirmModal();
@@ -412,7 +539,7 @@ export default function DataEditor() {
                 const updated = [...usersData];
                 const permissionKeys: (keyof UserPermissions)[] = [
                     'scanner', 'calculator', 'converter', 'cashcounter',
-                    'timingcontrol', 'controlhorario', 'supplierorders', 'mantenimiento', 'scanhistory'
+                    'timingcontrol', 'controlhorario', 'supplierorders', 'mantenimiento', 'solicitud', 'scanhistory'
                 ];
 
                 if (!updated[userIndex].permissions) {
@@ -440,19 +567,11 @@ export default function DataEditor() {
                         setSavingUserKey(key);
                         await UsersService.updateUserPermissions(user.id, newPermissions);
 
-                        setNotification({
-                            message: `Todos los permisos ${value ? 'habilitados' : 'deshabilitados'} para ${user.name}`,
-                            type: 'success'
-                        });
-                        setTimeout(() => setNotification(null), 3000);
+                        showToast(`Todos los permisos ${value ? 'habilitados' : 'deshabilitados'} para ${user.name}`, 'success', 3000);
 
                     } catch (error) {
                         console.error('Error updating all user permissions:', error);
-                        setNotification({
-                            message: `Error al actualizar permisos para ${user.name}`,
-                            type: 'error'
-                        });
-                        setTimeout(() => setNotification(null), 5000);
+                        showToast(`Error al actualizar permisos para ${user.name}`, 'error', 5000);
                     } finally {
                         setSavingUserKey(null);
                     }
@@ -472,6 +591,7 @@ export default function DataEditor() {
             controlhorario: 'Control Horario',
             supplierorders: 'Órdenes Proveedor',
             mantenimiento: 'Mantenimiento',
+            solicitud: 'Solicitud',
             scanhistory: 'Historial de Escaneos',
         };
         return labels[permission] || permission;
@@ -488,6 +608,7 @@ export default function DataEditor() {
             controlhorario: 'Registro de horarios de trabajo',
             supplierorders: 'Gestión de órdenes de proveedores',
             mantenimiento: 'Acceso al panel de administración',
+            solicitud: 'Permite gestionar solicitudes dentro del módulo de mantenimiento',
             scanhistory: 'Ver historial completo de escaneos realizados',
         };
         return descriptions[permission] || permission;
@@ -515,26 +636,26 @@ export default function DataEditor() {
                         <button
                             onClick={() => setAllUserPermissions(index, true)}
                             disabled={isDisabled}
-                            className="text-xs px-2 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="text-xs px-2 py-1 bg-[var(--success)] text-white rounded hover:bg-[var(--button-hover)] disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                             Habilitar Todo
                         </button>
                         <button
                             onClick={() => setAllUserPermissions(index, false)}
                             disabled={isDisabled}
-                            className="text-xs px-2 py-1 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="text-xs px-2 py-1 bg-[var(--error)] text-white rounded hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                             Deshabilitar Todo
                         </button>
                         <button
                             onClick={() => setPermissionsEditable(prev => ({ ...prev, [key]: !prev[key] }))}
-                            className="text-xs px-2 py-1 bg-indigo-600 text-white rounded hover:bg-indigo-700"
+                            className="text-xs px-2 py-1 bg-[var(--secondary)] text-white rounded hover:opacity-90"
                         >
                             {permissionsEditable[key] ? 'Bloquear Permisos' : 'Editar Permisos'}
                         </button>
                         <button
                             onClick={() => setShowPermissions(prev => ({ ...prev, [key]: !prev[key] }))}
-                            className="text-xs px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
+                            className="text-xs px-2 py-1 bg-[var(--primary)] text-white rounded hover:bg-[var(--button-hover)]"
                         >
                             {showPermissions[key] ? 'Vista Compacta' : 'Vista Detallada'}
                         </button>
@@ -550,8 +671,8 @@ export default function DataEditor() {
                                 <div
                                     key={permission}
                                     className={`flex items-center gap-3 p-3 border-2 rounded-lg transition-all ${hasAccess
-                                        ? 'border-green-300 dark:border-green-600 bg-green-50 dark:bg-green-900/20 hover:bg-green-100 dark:hover:bg-green-900/30'
-                                        : 'border-gray-300 dark:border-gray-600 bg-gray-50 dark:bg-gray-800/50 hover:bg-gray-100 dark:hover:bg-gray-800/70'
+                                        ? 'border-[var(--success)] bg-[var(--muted)] hover:opacity-90'
+                                        : 'border-[var(--border)] bg-[var(--card-bg)] hover:opacity-90'
                                         }`}
                                 >
                                     <input
@@ -568,7 +689,7 @@ export default function DataEditor() {
                                             (updated[index].permissions as unknown as Record<string, unknown>)[permission] = e.target.checked;
                                             setUsersData(updated);
                                         }}
-                                        className="w-5 h-5 text-green-600 border-2 rounded focus:ring-green-500 focus:ring-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                                        className="w-5 h-5 text-[var(--success)] border-2 rounded focus:ring-[var(--success)] focus:ring-2 disabled:opacity-50 disabled:cursor-not-allowed"
                                         style={{
                                             backgroundColor: 'var(--input-bg)',
                                             borderColor: 'var(--input-border)'
@@ -582,8 +703,8 @@ export default function DataEditor() {
                                         <div className="text-sm" style={{ color: 'var(--muted-foreground)' }}>{getPermissionDescription(permission)}</div>
                                     </label>
                                     <div className={`px-2 py-1 rounded text-xs font-medium ${hasAccess
-                                        ? 'bg-green-200 dark:bg-green-900/40 text-green-800 dark:text-green-200'
-                                        : 'bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300'
+                                        ? 'bg-[var(--success)] text-white'
+                                        : 'bg-[var(--muted)] text-[var(--muted-foreground)]'
                                         }`}>
                                         {hasAccess ? 'Activo' : 'Inactivo'}
                                     </div>
@@ -599,8 +720,8 @@ export default function DataEditor() {
                                 <label
                                     key={permission}
                                     className={`flex items-center gap-1 text-xs px-2 py-1 rounded cursor-pointer border transition-colors ${hasAccess
-                                        ? 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-200 border-green-200 dark:border-green-700 hover:bg-green-200 dark:hover:bg-green-900/50'
-                                        : 'bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-200 border-red-200 dark:border-red-700 hover:bg-red-200 dark:hover:bg-red-900/50'
+                                        ? 'bg-[var(--success)] text-white border-[var(--success)] hover:opacity-90'
+                                        : 'bg-[var(--error)] text-white border-[var(--error)] hover:opacity-90'
                                         }`}
                                 >
                                     <input
@@ -739,11 +860,11 @@ export default function DataEditor() {
                 // Después de recargar datos, asegurar que el control de edición de permisos está bloqueado
                 setPermissionsEditable(prev => ({ ...prev, [key]: false }));
             }
-            showNotification(`Usuario ${user.name} guardado exitosamente`, 'success');
+            showToast(`Usuario ${user.name} guardado exitosamente`, 'success');
             // Clear global changes flag so UI removes "Cambios pendientes" badges
             setHasChanges(false);
         } catch (error) {
-            showNotification('Error al guardar el usuario', 'error');
+            showToast('Error al guardar el usuario', 'error');
             console.error('Error saving user:', error);
         } finally {
             setSavingUserKey(null);
@@ -755,10 +876,10 @@ export default function DataEditor() {
     // Funciones para manejar configuración CCSS
     const addCcssConfig = () => {
         const ownerId = resolveOwnerIdForActor();
-        
+
         // Verificar si ya existe un config para este owner
         const existingConfigIndex = ccssConfigsData.findIndex(config => config.ownerId === ownerId);
-        
+
         if (existingConfigIndex !== -1) {
             // Si existe, agregar una nueva company al array
             const updatedConfigs = [...ccssConfigsData];
@@ -795,19 +916,19 @@ export default function DataEditor() {
     const updateCcssConfig = (configIndex: number, companyIndex: number, field: string, value: string | number) => {
         const updated = [...ccssConfigsData];
         const updatedCompanies = [...updated[configIndex].companie];
-        
+
         if (field === 'ownerCompanie') {
-            updatedCompanies[companyIndex] = { 
-                ...updatedCompanies[companyIndex], 
-                ownerCompanie: value as string 
+            updatedCompanies[companyIndex] = {
+                ...updatedCompanies[companyIndex],
+                ownerCompanie: value as string
             };
         } else if (['mt', 'tc', 'valorhora', 'horabruta'].includes(field)) {
-            updatedCompanies[companyIndex] = { 
-                ...updatedCompanies[companyIndex], 
-                [field]: value as number 
+            updatedCompanies[companyIndex] = {
+                ...updatedCompanies[companyIndex],
+                [field]: value as number
             };
         }
-        
+
         updated[configIndex] = {
             ...updated[configIndex],
             companie: updatedCompanies
@@ -823,7 +944,7 @@ export default function DataEditor() {
             config: CcssConfig;
             company: companies;
         }> = [];
-        
+
         ccssConfigsData.forEach((config, configIndex) => {
             config.companie.forEach((company, companyIndex) => {
                 flattened.push({
@@ -834,7 +955,7 @@ export default function DataEditor() {
                 });
             });
         });
-        
+
         return flattened;
     };
 
@@ -850,10 +971,10 @@ export default function DataEditor() {
                 try {
                     const updatedConfigs = [...ccssConfigsData];
                     const updatedCompanies = [...updatedConfigs[configIndex].companie];
-                    
+
                     // Remover la company específica
                     updatedCompanies.splice(companyIndex, 1);
-                    
+
                     if (updatedCompanies.length === 0) {
                         // Si no quedan companies, eliminar todo el config
                         if (config.id) {
@@ -870,12 +991,12 @@ export default function DataEditor() {
                             await CcssConfigService.updateCcssConfig(updatedConfigs[configIndex]);
                         }
                     }
-                    
+
                     setCcssConfigsData(updatedConfigs);
-                    showNotification(`Configuración para ${configName} eliminada exitosamente`, 'success');
+                    showToast(`Configuración para ${configName} eliminada exitosamente`, 'success');
                 } catch (error) {
                     console.error('Error deleting CCSS config:', error);
-                    showNotification('Error al eliminar la configuración', 'error');
+                    showToast('Error al eliminar la configuración', 'error');
                 }
             }
         );
@@ -912,16 +1033,7 @@ export default function DataEditor() {
                     </div>
                 </div>
             )}
-            {/* Notification */}
-            {notification && (
-                <div className={`fixed top-6 right-6 z-50 px-6 py-3 rounded-xl shadow-2xl flex items-center gap-2 font-semibold animate-fade-in ${notification.type === 'success' ? 'bg-green-500' :
-                    notification.type === 'error' ? 'bg-red-500' : 'bg-blue-500'
-                    } text-white`}>
-                    {notification.type === 'success' && <Check className="w-5 h-5" />}
-                    {notification.type === 'error' && <AlertCircle className="w-5 h-5" />}
-                    {notification.message}
-                </div>
-            )}
+            {/* notifications now use global ToastProvider */}
 
 
             {/* File Tabs */}
@@ -1150,31 +1262,31 @@ export default function DataEditor() {
                                             const e = empresasData[idx];
                                             if (e.id) {
                                                 await EmpresasService.updateEmpresa(e.id, e);
-                                                showNotification('Empresa actualizada', 'success');
+                                                showToast('Empresa actualizada', 'success');
                                             } else {
                                                 const ownerIdToUse = resolveOwnerIdForActor(e.ownerId);
                                                 const idToUse = e.name && e.name.trim() !== '' ? e.name.trim() : undefined;
                                                 if (!idToUse) {
-                                                    showNotification('El nombre (name) es requerido para crear la empresa con id igual a name', 'error');
+                                                    showToast('El nombre (name) es requerido para crear la empresa con id igual a name', 'error');
                                                 } else {
                                                     try {
                                                         await EmpresasService.addEmpresa({ id: idToUse, ownerId: ownerIdToUse, name: e.name || '', ubicacion: e.ubicacion || '', empleados: e.empleados || [] });
                                                         await loadData();
-                                                        showNotification('Empresa creada', 'success');
+                                                        showToast('Empresa creada', 'success');
                                                     } catch (err) {
                                                         const message = err && (err as Error).message ? (err as Error).message : 'Error al guardar empresa';
                                                         // If it's owner limit, show modal with explanation; otherwise fallback to notification
                                                         if (message.includes('maximum allowed companies') || message.toLowerCase().includes('max')) {
                                                             openConfirmModal('Límite de empresas', message, () => { /* sólo cerrar */ }, { singleButton: true, singleButtonText: 'Cerrar' });
                                                         } else {
-                                                            showNotification('Error al guardar empresa', 'error');
+                                                            showToast('Error al guardar empresa', 'error');
                                                         }
                                                     }
                                                 }
                                             }
                                         } catch (err) {
                                             console.error('Error saving empresa:', err);
-                                            showNotification('Error al guardar empresa', 'error');
+                                            showToast('Error al guardar empresa', 'error');
                                         }
                                     }}
                                     className="px-3 py-2 sm:px-4 rounded-md bg-green-600 hover:bg-green-700 text-white transition-colors text-sm sm:text-base"
@@ -1187,10 +1299,10 @@ export default function DataEditor() {
                                             const e = empresasData[idx];
                                             if (e.id) await EmpresasService.deleteEmpresa(e.id);
                                             setEmpresasData(prev => prev.filter((_, i) => i !== idx));
-                                            showNotification('Empresa eliminada', 'success');
+                                            showToast('Empresa eliminada', 'success');
                                         } catch (err) {
                                             console.error('Error deleting empresa:', err);
-                                            showNotification('Error al eliminar empresa', 'error');
+                                            showToast('Error al eliminar empresa', 'error');
                                         }
                                     })}
                                     className="px-3 py-2 sm:px-4 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors text-sm sm:text-base"
@@ -1388,8 +1500,10 @@ export default function DataEditor() {
                                         )}
                                     </select>
                                 </div>
-                                {/* If role is admin and not delegated (eliminate === false), show maxCompanies field */}
-                                {user.role === 'admin' && user.eliminate === false && (
+                                {/* If role is admin and not delegated (eliminate === false), show maxCompanies field
+                                    But if the current authenticated actor is an admin and this is a newly-created user (no id),
+                                    hide the input per requirement. */}
+                                {user.role === 'admin' && user.eliminate === false && !(currentUser?.role === 'admin' && !user.id) && (
                                     <div>
                                         <label className="block text-sm font-medium mb-1">Máx. Empresas:</label>
                                         <input
@@ -1545,16 +1659,16 @@ export default function DataEditor() {
                                                         // Crear una nueva copia del config completo con la company actualizada
                                                         const updatedConfig = {
                                                             ...item.config,
-                                                            companie: item.config.companie.map((comp, idx) => 
+                                                            companie: item.config.companie.map((comp, idx) =>
                                                                 idx === item.companyIndex ? item.company : comp
                                                             )
                                                         };
                                                         await CcssConfigService.updateCcssConfig(updatedConfig);
-                                                        showNotification(`Configuración para ${item.company.ownerCompanie || 'empresa'} guardada exitosamente`, 'success');
+                                                        showToast(`Configuración para ${item.company.ownerCompanie || 'empresa'} guardada exitosamente`, 'success');
                                                         await loadData();
                                                     } catch (error) {
                                                         console.error('Error saving CCSS config:', error);
-                                                        showNotification('Error al guardar la configuración', 'error');
+                                                        showToast('Error al guardar la configuración', 'error');
                                                     }
                                                 }}
                                                 className="px-4 py-2 bg-gradient-to-r from-green-500 to-green-600 text-white rounded-lg hover:from-green-600 hover:to-green-700 transition-all duration-200 shadow-md hover:shadow-lg font-medium text-sm flex items-center gap-2"
@@ -1591,16 +1705,33 @@ export default function DataEditor() {
                                                 className="w-full px-4 py-3 border border-blue-300 dark:border-blue-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 shadow-sm"
                                             >
                                                 <option value="">Seleccionar empresa...</option>
-                                                {empresasData
-                                                    .filter(empresa => empresa.ownerId === resolveOwnerIdForActor())
-                                                    .map((empresa, idx) => (
-                                                        <option key={empresa.id || idx} value={empresa.name}>
-                                                            {empresa.name}
-                                                        </option>
-                                                    ))
-                                                }
+                                                {(() => {
+                                                    // Build allowed ownerId set: currentUser.id, currentUser.ownerId and session.ownerId
+                                                    if (!currentUser || currentUser.role === 'superadmin') {
+                                                        return (empresasData || []).map((empresa, idx) => (
+                                                            <option key={empresa.id || idx} value={empresa.name}>{empresa.name}</option>
+                                                        ));
+                                                    }
+
+                                                    const allowed = new Set<string>();
+                                                    if (currentUser.id) allowed.add(String(currentUser.id));
+                                                    if (currentUser.ownerId) allowed.add(String(currentUser.ownerId));
+                                                    try {
+                                                        if (typeof window !== 'undefined') {
+                                                            const sessionRaw = localStorage.getItem('pricemaster_session');
+                                                            if (sessionRaw) {
+                                                                const session = JSON.parse(sessionRaw);
+                                                                if (session && session.ownerId) allowed.add(String(session.ownerId));
+                                                            }
+                                                        }
+                                                    } catch {}
+
+                                                    return (empresasData || []).filter(empresa => empresa && empresa.ownerId && allowed.has(String(empresa.ownerId))).map((empresa, idx) => (
+                                                        <option key={empresa.id || idx} value={empresa.name}>{empresa.name}</option>
+                                                    ));
+                                                })()}
                                             </select>
-                                            
+
                                         </div>
                                     </div>
 

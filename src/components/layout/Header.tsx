@@ -1,18 +1,43 @@
 'use client'
 
 import Image from 'next/image';
-import { Settings, LogOut, Menu, X, Scan, Calculator, Type, Banknote, Smartphone, Clock, Truck, History, User, ChevronDown } from 'lucide-react';
-import { useState, useEffect } from 'react';
+import { Settings, LogOut, Menu, X, Scan, Calculator, Type, Banknote, Smartphone, Clock, Truck, History, User, ChevronDown, Bell, UserPlus, Layers } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { collection, query as fbQuery, where as fbWhere, orderBy as fbOrderBy, onSnapshot } from 'firebase/firestore';
+import { db } from '../../config/firebase';
 import { createPortal } from 'react-dom';
+import { usePathname, useRouter } from 'next/navigation';
 import { useAuth } from '../../hooks/useAuth';
+import { SolicitudesService } from '@/services/solicitudes';
 import { ThemeToggle } from './ThemeToggle';
 import { getDefaultPermissions } from '../../utils/permissions';
 import FloatingSessionTimer from '../session/FloatingSessionTimer';
 import EditProfileModal from '../edicionPerfil/EditProfileModal';
-import { ConfigurationModal, CalculatorModal } from '../modals';
+import { ConfigurationModal, CalculatorModal, NotificationModal } from '../modals';
 import type { UserPermissions } from '../../types/firestore';
 
-type ActiveTab = 'scanner' | 'calculator' | 'converter' | 'cashcounter' | 'timingcontrol' | 'controlhorario' | 'supplierorders' | 'histoscans' | 'scanhistory' | 'edit'
+const getCreatedAtDate = (value: any): Date | null => {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (typeof value.toDate === 'function') {
+    try {
+      const asDate = value.toDate();
+      if (asDate instanceof Date && !Number.isNaN(asDate.getTime())) return asDate;
+      const fallback = new Date(asDate);
+      if (!Number.isNaN(fallback.getTime())) return fallback;
+    } catch {
+      // ignore conversion errors
+    }
+  }
+  if (typeof value === 'object' && typeof value.seconds === 'number') {
+    return new Date(value.seconds * 1000);
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+};
+
+type ActiveTab = 'scanner' | 'calculator' | 'converter' | 'cashcounter' | 'timingcontrol' | 'controlhorario' | 'supplierorders' | 'histoscans' | 'scanhistory' | 'edit' | 'solicitud'
 
 interface HeaderProps {
   activeTab?: ActiveTab | null;
@@ -21,21 +46,38 @@ interface HeaderProps {
 
 export default function Header({ activeTab, onTabChange }: HeaderProps) {
   const { logout, user } = useAuth();
+  const pathname = usePathname();
+  const router = useRouter();
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [showEditProfileModal, setShowEditProfileModal] = useState(false);
   const [showUserDropdown, setShowUserDropdown] = useState(false);
+  const [showNotifModal, setShowNotifModal] = useState(false);
+  const [hasNewSolicitudes, setHasNewSolicitudes] = useState(false);
   const [isClient, setIsClient] = useState(false);
   const [dropdownPosition, setDropdownPosition] = useState({ top: 0, right: 0 });
   const [showSessionTimer, setShowSessionTimer] = useState(false);
   const [showCalculator, setShowCalculator] = useState(false);
   const [showCalculatorModal, setShowCalculatorModal] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const initializedSolicitudesRef = useRef(false);
+  const knownSolicitudesRef = useRef<Set<string>>(new Set());
+  const [currentHash, setCurrentHash] = useState('');
 
   // Ensure component is mounted on client
   useEffect(() => {
     setIsClient(true);
   }, []);
+
+  useEffect(() => {
+    if (!isClient) return;
+    if (!audioRef.current) {
+      const audio = new Audio('/arrival-sound.mp3');
+      audio.preload = 'auto';
+      audioRef.current = audio;
+    }
+  }, [isClient]);
 
   // Cargar preferencia del FloatingSessionTimer desde localStorage
   useEffect(() => {
@@ -68,6 +110,15 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
       localStorage.setItem('show-calculator', showCalculator.toString());
     }
   }, [showCalculator]);
+
+  // Keep currentHash in sync in case some code manipulates history.hash
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const updateHash = () => setCurrentHash(window.location.hash || '');
+    updateHash();
+    window.addEventListener('hashchange', updateHash);
+    return () => window.removeEventListener('hashchange', updateHash);
+  }, []);
 
   // Close dropdown on scroll or resize
   useEffect(() => {
@@ -106,6 +157,112 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
     };
   }, [showConfigModal, showEditProfileModal]);
 
+  // Real-time listener for solicitudes for the user's company (onSnapshot)
+  useEffect(() => {
+    if (!isClient || !user) return;
+
+    const company = (user as any)?.ownercompanie || (user as any)?.ownerCompanie || '';
+    if (!company) {
+      knownSolicitudesRef.current = new Set();
+      initializedSolicitudesRef.current = false;
+      setHasNewSolicitudes(false);
+      return;
+    }
+
+    knownSolicitudesRef.current = new Set();
+    initializedSolicitudesRef.current = false;
+
+    try {
+      const q = fbQuery(
+        collection(db, 'solicitudes'),
+        fbWhere('empresa', '==', company),
+        fbOrderBy('createdAt', 'desc')
+      );
+
+      const handleSolicitudesUpdate = (docs: any[]) => {
+        const safeDocs = Array.isArray(docs) ? docs : [];
+        const pendingDocs = safeDocs.filter((doc) => !doc?.listo);
+
+        if (initializedSolicitudesRef.current) {
+          const previousIds = knownSolicitudesRef.current;
+          const hasNewPending = pendingDocs.some((doc) => {
+            const id = doc?.id;
+            return typeof id === 'string' && !previousIds.has(id);
+          });
+
+          if (hasNewPending) {
+            const player = audioRef.current ?? (typeof Audio !== 'undefined' ? new Audio('/arrival-sound.mp3') : null);
+            if (player) {
+              audioRef.current = player;
+              try {
+                player.currentTime = 0;
+                const playPromise = player.play();
+                if (playPromise && typeof playPromise.catch === 'function') {
+                  playPromise.catch((err) => {
+                    console.warn('Unable to play notification sound:', err);
+                  });
+                }
+              } catch (err) {
+                console.warn('Unable to play notification sound:', err);
+              }
+            }
+          }
+        }
+
+        knownSolicitudesRef.current = new Set(
+          pendingDocs
+            .map((doc) => doc?.id)
+            .filter((id): id is string => typeof id === 'string')
+        );
+        initializedSolicitudesRef.current = true;
+
+        const candidate = pendingDocs[0] ?? safeDocs[0];
+        if (!candidate) {
+          setHasNewSolicitudes(false);
+          return;
+        }
+
+        const createdAt = getCreatedAtDate(candidate?.createdAt);
+        const key = `pricemaster_last_seen_solicitudes_${user.id || user.ownercompanie || 'anon'}`;
+        const lastSeenRaw = localStorage.getItem(key);
+        const lastSeen = lastSeenRaw ? new Date(lastSeenRaw) : null;
+
+        if (!lastSeen || (createdAt && createdAt.getTime() > lastSeen.getTime())) {
+          setHasNewSolicitudes(true);
+        } else {
+          setHasNewSolicitudes(false);
+        }
+      };
+
+      const unsubscribe = onSnapshot(q, async (snapshot) => {
+        try {
+          if (!snapshot || snapshot.empty) {
+            // fallback to service (handles normalization)
+            const rows = await SolicitudesService.getSolicitudesByEmpresa(company);
+            if (!rows || rows.length === 0) {
+              handleSolicitudesUpdate([]);
+              return;
+            }
+            handleSolicitudesUpdate(rows);
+            return;
+          }
+
+          const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+          handleSolicitudesUpdate(docs);
+        } catch (err) {
+          console.error('Error in solicitudes onSnapshot handler:', err);
+        }
+      }, (err) => {
+        console.error('onSnapshot error for solicitudes:', err);
+      });
+
+      return () => unsubscribe();
+    } catch (err) {
+      console.error('Error setting up solicitudes listener:', err);
+      return;
+    }
+  }, [isClient, user]);
+
   // Navigation tabs with permissions
   const allTabs = [
     { id: 'scanner' as ActiveTab, name: 'Escáner', icon: Scan, description: 'Escanear códigos de barras', permission: 'scanner' as keyof UserPermissions },
@@ -123,10 +280,12 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
     { id: 'supplierorders' as ActiveTab, name: 'Órdenes Proveedor', icon: Truck, description: 'Gestión de órdenes de proveedores', permission: 'supplierorders' as keyof UserPermissions },
     { id: 'edit' as ActiveTab, name: 'Mantenimiento', icon: Settings, description: 'Gestión y mantenimiento del sistema', permission: 'mantenimiento' as keyof UserPermissions },
     { id: 'histoscans' as ActiveTab, name: 'Historial de Escaneos', icon: History, description: 'Ver historial de escaneos realizados', permission: 'scanhistory' as keyof UserPermissions },
+    { id: 'solicitud' as ActiveTab, name: 'Solicitud', icon: Type, description: 'Solicitudes y trámites', permission: 'solicitud' as keyof UserPermissions },
   ];
 
   // Get user permissions or default if not available
-  const userPermissions = user?.permissions || getDefaultPermissions(user?.role);
+  const userPermissions = user?.permissions || getDefaultPermissions(user?.role || 'user');
+  const canManageFondoGeneral = Boolean(userPermissions.fondogeneral);
 
   // Filter tabs based on user permissions
   const visibleTabs = allTabs.filter(tab => {
@@ -135,7 +294,18 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
   });
 
   const handleLogoutClick = () => {
-    setShowLogoutConfirm(true);
+    // Si estamos en /home, limpiar sesión especial y redirigir
+    if (pathname === '/home') {
+      if (typeof window !== 'undefined') {
+        // Limpiar la sesión especial del usuario SEBASTIAN
+        localStorage.removeItem('pricemaster_session');
+        localStorage.removeItem('pricemaster_session_id');
+        window.location.href = '/';
+      }
+    } else {
+      // Para usuarios autenticados, mostrar modal de confirmación
+      setShowLogoutConfirm(true);
+    }
   };
 
   const handleLogoClick = () => {
@@ -190,13 +360,90 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
           >
             <Image
               src="/favicon-32x32.png"
-              alt="Price Master Logo"
+              alt="Time Master Logo"
               width={32}
               height={32}
               className="rounded"
             />
-            Price Master
+            Time Master
           </button>
+
+          {/* If we're inside the Fondo General area, show its quick actions in the header */}
+          {pathname && pathname.startsWith('/fondogeneral') && canManageFondoGeneral && (
+            <nav className="hidden lg:flex items-center gap-1">
+              {/* Agregar proveedor */}
+              <button
+                onClick={() => {
+                  (async () => {
+                    try {
+                      await router.push('/fondogeneral/agregarproveedor');
+                    } catch {
+                      window.location.href = '/fondogeneral/agregarproveedor';
+                    }
+                  })();
+                }}
+                className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors relative ${pathname === '/fondogeneral/agregarproveedor'
+                  ? 'text-[var(--tab-text-active)] font-semibold'
+                  : 'text-[var(--tab-text)] hover:text-[var(--tab-hover-text)] hover:bg-[var(--hover-bg)]'
+                }`}
+                title="Agregar proveedor"
+              >
+                <UserPlus className="w-4 h-4" />
+                <span className="hidden xl:inline">Agregar proveedor</span>
+                {currentHash === '#agregarproveedor' && (
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-[var(--tab-text-active)] rounded-full"></div>
+                )}
+              </button>
+
+              {/* Fondo */}
+              <button
+                onClick={() => {
+                  (async () => {
+                    try {
+                      await router.push('/fondogeneral/fondogeneral');
+                    } catch {
+                      window.location.href = '/fondogeneral/fondogeneral';
+                    }
+                  })();
+                }}
+                className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors relative ${pathname === '/fondogeneral/fondogeneral' || pathname === '/fondogeneral'
+                  ? 'text-[var(--tab-text-active)] font-semibold'
+                  : 'text-[var(--tab-text)] hover:text-[var(--tab-hover-text)] hover:bg-[var(--hover-bg)]'
+                }`}
+                title="Fondo"
+              >
+                <Banknote className="w-4 h-4" />
+                <span className="hidden xl:inline">Fondo</span>
+                {(currentHash === '#fondogeneral' || (pathname === '/fondogeneral' && !currentHash)) && (
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-[var(--tab-text-active)] rounded-full"></div>
+                )}
+              </button>
+
+              {/* Otra */}
+              <button
+                onClick={() => {
+                  (async () => {
+                    try {
+                      await router.push('/fondogeneral/otra');
+                    } catch {
+                      window.location.href = '/fondogeneral/otra';
+                    }
+                  })();
+                }}
+                className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors relative ${pathname === '/fondogeneral/otra'
+                  ? 'text-[var(--tab-text-active)] font-semibold'
+                  : 'text-[var(--tab-text)] hover:text-[var(--tab-hover-text)] hover:bg-[var(--hover-bg)]'
+                }`}
+                title="Otra"
+              >
+                <Layers className="w-4 h-4" />
+                <span className="hidden xl:inline">Otra</span>
+                {currentHash === '#otra' && (
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-[var(--tab-text-active)] rounded-full"></div>
+                )}
+              </button>
+            </nav>
+          )}
 
           {/* Desktop navigation tabs - only show when inside a card */}
           {activeTab && visibleTabs.length > 0 && (
@@ -225,72 +472,74 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
           )}
 
           <div className="flex items-center gap-2" suppressHydrationWarning>
-            {/* User dropdown menu */}
-            {user && (
+            {/* User dropdown menu - solo mostrar si hay usuario O si estamos en /home */}
+            {(user || pathname === '/home') && (
               <div className="hidden md:flex items-center gap-2">
-                {/* User button with dropdown */}
-                <div className="relative" style={{ zIndex: 'auto' }}>
-                  <button
-                    onClick={handleUserDropdownClick}
-                    className="flex items-center gap-2 px-3 py-1 bg-transparent rounded-lg border border-[var(--input-border)] hover:bg-[var(--hover-bg)] transition-colors"
-                  >
-                    <User className="w-4 h-4 text-[var(--muted-foreground)]" />
-                    <span className="text-sm font-sans font-bold text-[var(--foreground)]">{user.name}</span>
-                    <ChevronDown className={`w-4 h-4 text-[var(--muted-foreground)] transition-transform ${showUserDropdown ? 'rotate-180' : ''}`} />
-                  </button>
+                {/* User button with dropdown - solo si hay usuario autenticado */}
+                {user && (
+                  <div className="relative" style={{ zIndex: 'auto' }}>
+                    <button
+                      onClick={handleUserDropdownClick}
+                      className="flex items-center gap-2 px-3 py-1 bg-transparent rounded-lg border border-[var(--input-border)] hover:bg-[var(--hover-bg)] transition-colors"
+                    >
+                      <User className="w-4 h-4 text-[var(--muted-foreground)]" />
+                      <span className="text-sm font-sans font-bold text-[var(--foreground)]">{user.name}</span>
+                      <ChevronDown className={`w-4 h-4 text-[var(--muted-foreground)] transition-transform ${showUserDropdown ? 'rotate-180' : ''}`} />
+                    </button>
 
-                  {/* Dropdown menu - rendered in portal */}
-                  {showUserDropdown && isClient && createPortal(
-                    <>
-                      {/* Click outside to close dropdown */}
-                      <div
-                        className="fixed inset-0"
-                        style={{ zIndex: 2147483646 }} // One less than dropdown
-                        onClick={() => setShowUserDropdown(false)}
-                      />
+                    {/* Dropdown menu - rendered in portal */}
+                    {showUserDropdown && isClient && createPortal(
+                      <>
+                        {/* Click outside to close dropdown */}
+                        <div
+                          className="fixed inset-0"
+                          style={{ zIndex: 2147483646 }} // One less than dropdown
+                          onClick={() => setShowUserDropdown(false)}
+                        />
 
-                      {/* Dropdown content */}
-                      <div
-                        className="w-48 bg-[var(--background)] border border-[var(--input-border)] rounded-lg shadow-xl"
-                        style={{
-                          position: 'fixed',
-                          top: dropdownPosition.top,
-                          right: dropdownPosition.right,
-                          zIndex: 2147483647, // Maximum z-index value
-                          isolation: 'isolate',
-                          transform: 'translateZ(0)', // Force hardware acceleration
-                          willChange: 'transform', // Optimize for changes
-                          pointerEvents: 'auto' // Ensure it can be clicked
-                        }}
-                      >
-                        <div className="py-2">
-                          <button
-                            onClick={() => {
-                              setShowEditProfileModal(true);
-                              setShowUserDropdown(false);
-                            }}
-                            className="flex items-center gap-3 w-full px-4 py-2 text-sm text-[var(--foreground)] hover:bg-[var(--hover-bg)] transition-colors"
-                          >
-                            <User className="w-4 h-4 text-[var(--muted-foreground)]" />
-                            Editar Perfil
-                          </button>
+                        {/* Dropdown content */}
+                        <div
+                          className="w-48 bg-[var(--background)] border border-[var(--input-border)] rounded-lg shadow-xl"
+                          style={{
+                            position: 'fixed',
+                            top: dropdownPosition.top,
+                            right: dropdownPosition.right,
+                            zIndex: 2147483647, // Maximum z-index value
+                            isolation: 'isolate',
+                            transform: 'translateZ(0)', // Force hardware acceleration
+                            willChange: 'transform', // Optimize for changes
+                            pointerEvents: 'auto' // Ensure it can be clicked
+                          }}
+                        >
+                          <div className="py-2">
+                            <button
+                              onClick={() => {
+                                setShowEditProfileModal(true);
+                                setShowUserDropdown(false);
+                              }}
+                              className="flex items-center gap-3 w-full px-4 py-2 text-sm text-[var(--foreground)] hover:bg-[var(--hover-bg)] transition-colors"
+                            >
+                              <User className="w-4 h-4 text-[var(--muted-foreground)]" />
+                              Editar Perfil
+                            </button>
 
-                          <button
-                            onClick={() => {
-                              setShowConfigModal(true);
-                              setShowUserDropdown(false);
-                            }}
-                            className="flex items-center gap-3 w-full px-4 py-2 text-sm text-[var(--foreground)] hover:bg-[var(--hover-bg)] transition-colors"
-                          >
-                            <Settings className="w-4 h-4 text-[var(--muted-foreground)]" />
-                            Configuración de Sesión
-                          </button>
+                            <button
+                              onClick={() => {
+                                setShowConfigModal(true);
+                                setShowUserDropdown(false);
+                              }}
+                              className="flex items-center gap-3 w-full px-4 py-2 text-sm text-[var(--foreground)] hover:bg-[var(--hover-bg)] transition-colors"
+                            >
+                              <Settings className="w-4 h-4 text-[var(--muted-foreground)]" />
+                              Configuración de Sesión
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    </>,
-                    document.body
-                  )}
-                </div>
+                      </>,
+                      document.body
+                    )}
+                  </div>
+                )}
 
                 {/* Logout button - separate from dropdown */}
                 <button
@@ -302,6 +551,29 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
                 </button>
               </div>
             )}
+
+            {/* Notification icon for small screens (left of hamburger) */}
+            <button
+              onClick={() => {
+                try {
+                  if (user) {
+                    const key = `pricemaster_last_seen_solicitudes_${user.id || user.ownercompanie || 'anon'}`;
+                    localStorage.setItem(key, new Date().toISOString());
+                    setHasNewSolicitudes(false);
+                  }
+                } catch {
+                  // ignore storage errors
+                }
+                setShowNotifModal(true);
+              }}
+              className="relative p-2 rounded-md hover:bg-[var(--hover-bg)] transition-colors"
+              title="Notificaciones"
+            >
+              <Bell className="w-5 h-5 text-[var(--foreground)]" />
+              {hasNewSolicitudes && (
+                <span className="absolute top-0 right-0 inline-flex w-2 h-2 bg-red-500 rounded-full transform translate-x-1 -translate-y-1" />
+              )}
+            </button>
 
             {/* Mobile hamburger menu button */}
             <button
@@ -414,6 +686,16 @@ export default function Header({ activeTab, onTabChange }: HeaderProps) {
           </div>
         </div>
       )}
+
+      {/* Notification modal (small screens) - now uses NotificationModal from modals folder */}
+      <NotificationModal
+        isOpen={showNotifModal}
+        onClose={() => setShowNotifModal(false)}
+        onSave={async (payload) => {
+          // Default behaviour for now: just log the payload. You can replace with any action.
+          console.log('NotificationModal saved:', payload)
+        }}
+      />
 
       {/* Configuration Modal */}
       <ConfigurationModal
