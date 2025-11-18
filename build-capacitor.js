@@ -40,7 +40,13 @@ async function buildForCapacitor() {
     
     // 3. Run Next.js build
     console.log('Building Next.js app...');
-    execSync('npm run build', { stdio: 'inherit' });
+    execSync('npm run build', {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        NEXT_BUILD_TARGET: 'capacitor',
+      },
+    });
     
     // 4. Create fallback for dynamic routes (simple redirect)
     console.log('Creating fallback for dynamic routes...');

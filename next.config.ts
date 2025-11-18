@@ -1,10 +1,11 @@
 import type { NextConfig } from "next";
 
+const isStaticExport = process.env.NEXT_BUILD_TARGET === 'capacitor';
+
 const nextConfig: NextConfig = {
   /* config options here */
-  output: 'export',
+  ...(isStaticExport ? { output: 'export', distDir: 'out' } : {}),
   trailingSlash: true,
-  distDir: 'out',
   generateBuildId: async () => {
     return 'build-' + Date.now()
   },
