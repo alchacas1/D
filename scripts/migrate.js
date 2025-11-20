@@ -5,27 +5,7 @@
  * This script migrates data from JSON files to Firestore
  */
 
-const fs = require('fs');
-const path = require('path');
-const dotenv = require('dotenv');
-
-const ENV_FILES = ['.env.local', '.env'];
-ENV_FILES.forEach(envFile => {
-  const fullPath = path.resolve(__dirname, '..', envFile);
-  if (fs.existsSync(fullPath)) {
-    dotenv.config({ path: fullPath });
-  }
-});
-
-require('ts-node').register({
-  transpileOnly: true,
-  compilerOptions: {
-    module: 'CommonJS',
-    moduleResolution: 'node10',
-  },
-});
-
-const { MigrationService } = require('../src/utils/migration');
+const { MigrationService } = require('./src/utils/migration');
 
 async function main() {
   try {
