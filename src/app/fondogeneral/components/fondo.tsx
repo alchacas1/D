@@ -42,28 +42,55 @@ import {
     MovementStorageState,
 } from '../../../services/movimientos-fondos';
 import AgregarMovimiento from './AgregarMovimiento';
+import DailyClosingModal, { DailyClosingFormValues } from './DailyClosingModal';
 
 const FONDO_INGRESO_TYPES = ['VENTAS', 'OTROS INGRESOS'] as const;
-const FONDO_EGRESO_TYPES = [
-    'COMPRA INVENTARIO',
+
+const FONDO_GASTO_TYPES = [
     'SALARIOS',
-    'REPARACION EQUIPO',
+    'CARGAS SOCIALES',
+    'AGUINALDOS',
+    'VACACIONES',
+    'POLIZA RIESGOS DE TRABAJO',
+    'PAGO TIMBRE Y EDUCACION',
+    'PAGO IMPUESTOS A SOCIEDADES',
+    'PATENTES MUNICIPALES',
+    'ALQUILER LOCAL',
+    'ELECTRICIDAD',
+    'AGUA',
+    'INTERNET',
+    'MANTENIMIENTO INSTALACIONES',
+    'PAPELERIA Y UTILES',
+    'ASEO Y LIMPIEZA',
+    'REDES SOCIALES',
+    'MATERIALES DE EMPAQUE',
+    'CONTROL PLAGAS',
+    'MONITOREO DE ALARMAS',
+    'FACTURA ELECTRONICA',
+    'GASTOS VARIOS',
+] as const;
+
+const FONDO_EGRESO_TYPES = [
     'PAGO TIEMPOS',
     'PAGO BANCA',
-    'CARGAS SOCIALES',
-    'ELECTRICIDAD',
+    'COMPRA INVENTARIO',
+    'COMPRA ACTIVOS',
+    'PAGO IMPUESTO RENTA',
+    'PAGO IMPUESTO IVA',
+    'EGRESOS VARIOS',
 ] as const;
 
 // Opciones visibles en el selector
-const FONDO_TYPE_OPTIONS = [...FONDO_INGRESO_TYPES, ...FONDO_EGRESO_TYPES] as const;
+const FONDO_TYPE_OPTIONS = [...FONDO_INGRESO_TYPES, ...FONDO_GASTO_TYPES, ...FONDO_EGRESO_TYPES] as const;
 
-export type FondoMovementType = typeof FONDO_INGRESO_TYPES[number] | typeof FONDO_EGRESO_TYPES[number];
+export type FondoMovementType = typeof FONDO_INGRESO_TYPES[number] | typeof FONDO_GASTO_TYPES[number] | typeof FONDO_EGRESO_TYPES[number];
 
 const isFondoMovementType = (value: string): value is FondoMovementType =>
     FONDO_TYPE_OPTIONS.includes(value as FondoMovementType);
 
 const isIngresoType = (type: FondoMovementType) => (FONDO_INGRESO_TYPES as readonly string[]).includes(type);
-const isEgresoType = (type: FondoMovementType) => !isIngresoType(type);
+const isGastoType = (type: FondoMovementType) => (FONDO_GASTO_TYPES as readonly string[]).includes(type);
+const isEgresoType = (type: FondoMovementType) => (FONDO_EGRESO_TYPES as readonly string[]).includes(type);
 
 // Formatea en Titulo Caso cada palabra
 const formatMovementType = (type: FondoMovementType) =>
@@ -82,9 +109,10 @@ const normalizeStoredType = (value: unknown): FondoMovementType => {
         if (upper === 'INGRESO') return 'VENTAS';
         if (upper === 'EGRESO') return 'COMPRA INVENTARIO';
         if (upper === 'COMPRA') return 'COMPRA INVENTARIO';
-        if (upper === 'MANTENIMIENTO') return 'REPARACION EQUIPO';
+        if (upper === 'MANTENIMIENTO') return 'MANTENIMIENTO INSTALACIONES';
+        if (upper === 'REPARACION EQUIPO') return 'MANTENIMIENTO INSTALACIONES';
         if (upper === 'SALARIO' || upper === 'SALARIOS') return 'SALARIOS';
-        if (upper === 'GASTO') return 'ELECTRICIDAD'; // categoria generica de gasto
+        if (upper === 'GASTO') return 'GASTOS VARIOS';
     }
     return 'COMPRA INVENTARIO';
 };
@@ -107,10 +135,79 @@ export type FondoEntry = {
     auditDetails?: string;
 };
 
+type DailyClosingRecord = {
+    id: string;
+    createdAt: string;
+    closingDate: string;
+    manager: string;
+    totalCRC: number;
+    totalUSD: number;
+    recordedBalanceCRC: number;
+    recordedBalanceUSD: number;
+    diffCRC: number;
+    diffUSD: number;
+    notes: string;
+    breakdownCRC: Record<number, number>;
+    breakdownUSD: Record<number, number>;
+};
+
 const FONDO_KEY_SUFFIX = '_fondos_v1';
 const ADMIN_CODE = '12345'; // TODO: Permitir configurar este codigo desde el perfil de un administrador.
 
 const buildStorageKey = (namespace: string, suffix: string) => `${namespace}${suffix}`;
+
+const DAILY_CLOSINGS_STORAGE_PREFIX = 'fg_daily_closings';
+
+const buildDailyClosingStorageKey = (company: string, account: MovementAccountKey) => {
+    const normalizedCompany = company.trim().toLowerCase();
+    return `${DAILY_CLOSINGS_STORAGE_PREFIX}_${normalizedCompany || 'default'}_${account}`;
+};
+
+const sanitizeMoneyNumber = (value: unknown) => {
+    const parsed = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(parsed)) return 0;
+    return Math.trunc(parsed);
+};
+
+const sanitizeBreakdown = (input: unknown): Record<number, number> => {
+    if (!input || typeof input !== 'object') return {};
+    return Object.entries(input as Record<string, unknown>).reduce<Record<number, number>>((acc, [key, rawValue]) => {
+        const denom = Number(key);
+        if (!Number.isFinite(denom)) return acc;
+        const count = sanitizeMoneyNumber(rawValue);
+        if (count > 0) acc[Math.trunc(denom)] = count;
+        return acc;
+    }, {});
+};
+
+const sanitizeDailyClosings = (raw: unknown): DailyClosingRecord[] => {
+    if (!Array.isArray(raw)) return [];
+    const sanitized = raw.reduce<DailyClosingRecord[]>((acc, candidate) => {
+        if (!candidate || typeof candidate !== 'object') return acc;
+        const record = candidate as Partial<DailyClosingRecord>;
+        const id = typeof record.id === 'string' && record.id.trim().length > 0 ? record.id : `${Date.now()}_${acc.length}`;
+        const manager = typeof record.manager === 'string' ? record.manager : '';
+        const closingDate = typeof record.closingDate === 'string' ? record.closingDate : new Date().toISOString();
+        const createdAt = typeof record.createdAt === 'string' ? record.createdAt : closingDate;
+        acc.push({
+            id,
+            createdAt,
+            closingDate,
+            manager,
+            totalCRC: sanitizeMoneyNumber(record.totalCRC),
+            totalUSD: sanitizeMoneyNumber(record.totalUSD),
+            recordedBalanceCRC: sanitizeMoneyNumber(record.recordedBalanceCRC),
+            recordedBalanceUSD: sanitizeMoneyNumber(record.recordedBalanceUSD),
+            diffCRC: sanitizeMoneyNumber(record.diffCRC),
+            diffUSD: sanitizeMoneyNumber(record.diffUSD),
+            notes: typeof record.notes === 'string' ? record.notes : '',
+            breakdownCRC: sanitizeBreakdown(record.breakdownCRC),
+            breakdownUSD: sanitizeBreakdown(record.breakdownUSD),
+        });
+        return acc;
+    }, []);
+    return sanitized.slice(0, 50);
+};
 
 const NAMESPACE_PERMISSIONS: Record<string, keyof UserPermissions> = {
     fg: 'fondogeneral',
@@ -191,6 +288,9 @@ const resolveCreatedAt = (value: unknown): string | undefined => {
     return undefined;
 };
 
+const dateKeyFromDate = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
 const sanitizeFondoEntries = (
     rawEntries: unknown,
     forcedCurrency?: MovementCurrencyKey,
@@ -226,7 +326,7 @@ const sanitizeFondoEntries = (
             paymentType,
             currency,
             accountId,
-            amountEgreso: isEgresoType(paymentType) ? amountEgreso : 0,
+            amountEgreso: isEgresoType(paymentType) || isGastoType(paymentType) ? amountEgreso : 0,
             amountIngreso: isIngresoType(paymentType) ? amountIngreso : 0,
             manager,
             notes: coerceNotes(entry.notes),
@@ -491,7 +591,15 @@ export function ProviderSection({ id }: { id?: string }) {
                             <li key={p.code} className="flex items-center justify-between bg-[var(--muted)] p-3 rounded">
                                 <div>
                                     <div className="text-[var(--foreground)] font-semibold">{p.name}</div>
-                                    <div className="text-xs text-[var(--muted-foreground)]">Codigo: {p.code}</div>
+                                    <div className="text-xs text-[var(--muted-foreground)]">Código: {p.code}</div>
+                                    {p.type && (
+                                        <div className="text-xs text-[var(--muted-foreground)] mt-1">
+                                            Tipo: {p.type}
+                                            {p.category && <span className="ml-2 px-2 py-0.5 rounded bg-[var(--input-bg)] text-[10px]">
+                                                {p.category}
+                                            </span>}
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="flex items-center gap-3">
                                     <div className="text-xs text-[var(--muted-foreground)]">Empresa: {p.company}</div>
@@ -594,10 +702,22 @@ export function ProviderSection({ id }: { id?: string }) {
                                 className="w-full p-3 bg-[var(--input-bg)] border border-[var(--input-border)] rounded"
                                 disabled={!company || saving}
                             >
-                                <option value="">Tipo</option>
-                                {FONDO_TYPE_OPTIONS.map(opt => (
-                                    <option key={opt} value={opt}>{formatMovementType(opt)}</option>
-                                ))}
+                                <option value="">Seleccione un tipo</option>
+                                <optgroup label="Ingresos">
+                                    {FONDO_INGRESO_TYPES.map(opt => (
+                                        <option key={opt} value={opt}>{formatMovementType(opt)}</option>
+                                    ))}
+                                </optgroup>
+                                <optgroup label="Gastos">
+                                    {FONDO_GASTO_TYPES.map(opt => (
+                                        <option key={opt} value={opt}>{formatMovementType(opt)}</option>
+                                    ))}
+                                </optgroup>
+                                <optgroup label="Egresos">
+                                    {FONDO_EGRESO_TYPES.map(opt => (
+                                        <option key={opt} value={opt}>{formatMovementType(opt)}</option>
+                                    ))}
+                                </optgroup>
                             </select>
                         </div>
 
@@ -776,6 +896,9 @@ export function FondoSection({
     const [movementModalOpen, setMovementModalOpen] = useState(false);
     const [movementAutoCloseLocked, setMovementAutoCloseLocked] = useState(false);
     const [movementCurrency, setMovementCurrency] = useState<'CRC' | 'USD'>('CRC');
+    const [dailyClosingModalOpen, setDailyClosingModalOpen] = useState(false);
+    const [dailyClosings, setDailyClosings] = useState<DailyClosingRecord[]>([]);
+    const [dailyClosingsHydrated, setDailyClosingsHydrated] = useState(false);
     const [entriesHydrated, setEntriesHydrated] = useState(false);
     const [hydratedCompany, setHydratedCompany] = useState('');
     const [hydratedAccountKey, setHydratedAccountKey] = useState<MovementAccountKey>(accountKey);
@@ -788,6 +911,12 @@ export function FondoSection({
         () => (['CRC', 'USD'] as MovementCurrencyKey[]).filter(currency => currencyEnabled[currency]),
         [currencyEnabled],
     );
+    const closingsStorageKey = useMemo(() => {
+        if (accountKey !== 'FondoGeneral') return null;
+        const normalizedCompany = (company || '').trim();
+        if (normalizedCompany.length === 0) return null;
+        return buildDailyClosingStorageKey(normalizedCompany, accountKey);
+    }, [company, accountKey]);
     // Audit modal state: show full before/after history when an edited entry is clicked
     const [auditModalOpen, setAuditModalOpen] = useState(false);
     const [auditModalData, setAuditModalData] = useState<{ history?: any[] } | null>(null);
@@ -943,7 +1072,7 @@ export function FondoSection({
     }, [calendarFromOpen, calendarToOpen]);
 
     const isIngreso = isIngresoType(paymentType);
-    const isEgreso = isEgresoType(paymentType);
+    const isEgreso = isEgresoType(paymentType) || isGastoType(paymentType);
 
     const employeeOptions = useMemo(
         () => companyEmployees.filter(name => !!name && name.trim().length > 0),
@@ -1168,6 +1297,44 @@ export function FondoSection({
             setSelectedProvider('');
         }
     }, [providers, selectedProvider, editingEntryId, editingProviderCode]);
+
+    useEffect(() => {
+        setDailyClosingsHydrated(false);
+        if (accountKey !== 'FondoGeneral') {
+            setDailyClosings([]);
+            setDailyClosingsHydrated(true);
+            return;
+        }
+        if (!closingsStorageKey) {
+            setDailyClosings([]);
+            setDailyClosingsHydrated(true);
+            return;
+        }
+        try {
+            const stored = localStorage.getItem(closingsStorageKey);
+            if (!stored) {
+                setDailyClosings([]);
+                setDailyClosingsHydrated(true);
+                return;
+            }
+            const parsed = JSON.parse(stored) as unknown;
+            setDailyClosings(sanitizeDailyClosings(parsed));
+            setDailyClosingsHydrated(true);
+        } catch (err) {
+            console.error('Error reading stored daily closings:', err);
+            setDailyClosings([]);
+            setDailyClosingsHydrated(true);
+        }
+    }, [closingsStorageKey, accountKey]);
+
+    useEffect(() => {
+        if (!dailyClosingsHydrated || !closingsStorageKey || accountKey !== 'FondoGeneral') return;
+        try {
+            localStorage.setItem(closingsStorageKey, JSON.stringify(dailyClosings));
+        } catch (err) {
+            console.error('Error storing daily closings:', err);
+        }
+    }, [closingsStorageKey, dailyClosings, accountKey, dailyClosingsHydrated]);
 
     useEffect(() => {
         let isActive = true;
@@ -1603,6 +1770,10 @@ export function FondoSection({
         () => new Intl.NumberFormat('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 }),
         [],
     );
+    const dailyClosingDateFormatter = useMemo(
+        () => new Intl.DateTimeFormat('es-CR', { dateStyle: 'long' }),
+        [],
+    );
     const dateTimeFormatter = useMemo(
         () =>
             new Intl.DateTimeFormat('es-CR', {
@@ -1613,6 +1784,24 @@ export function FondoSection({
     );
     const formatByCurrency = (currency: 'CRC' | 'USD', value: number) =>
         currency === 'USD' ? `$ ${amountFormatterUSD.format(Math.trunc(value))}` : `₡ ${amountFormatter.format(Math.trunc(value))}`;
+
+    const formatDailyClosingDiff = (currency: 'CRC' | 'USD', diff: number) => {
+        if (diff === 0) return 'Sin diferencias';
+        const sign = diff > 0 ? '+' : '-';
+        return `${sign} ${formatByCurrency(currency, Math.abs(diff))}`;
+    };
+
+    const getDailyClosingDiffClass = (diff: number) => {
+        if (diff === 0) return 'text-[var(--muted-foreground)]';
+        return diff > 0 ? 'text-green-500' : 'text-red-500';
+    };
+
+    const buildBreakdownLines = (currency: 'CRC' | 'USD', breakdown?: Record<number, number>) => {
+        if (!breakdown) return [] as string[];
+        return Object.entries(breakdown)
+            .filter(([, count]) => count > 0)
+            .map(([denomination, count]) => `${count} x ${formatByCurrency(currency, Number(denomination))}`);
+    };
 
     const amountClass = (isActive: boolean, inputHasValue: boolean, isValid: boolean) => {
         if (!isActive) return 'border-[var(--input-border)]';
@@ -1689,6 +1878,63 @@ export function FondoSection({
         setMovementModalOpen(true);
     };
 
+    const handleOpenDailyClosing = () => {
+        if (accountKey !== 'FondoGeneral') return;
+        setDailyClosingModalOpen(true);
+    };
+
+    const handleCloseDailyClosing = () => {
+        setDailyClosingModalOpen(false);
+    };
+
+    const handleConfirmDailyClosing = (closing: DailyClosingFormValues) => {
+        if (accountKey !== 'FondoGeneral') {
+            setDailyClosingModalOpen(false);
+            return;
+        }
+
+        const managerName = closing.manager.trim();
+        if (!managerName) {
+            setDailyClosingModalOpen(false);
+            return;
+        }
+
+        let closingDateValue = closing.closingDate
+            ? new Date(closing.closingDate)
+            : new Date();
+        if (Number.isNaN(closingDateValue.getTime())) {
+            closingDateValue = new Date();
+        }
+
+        const createdAt = new Date().toISOString();
+        const diffCRC = Math.trunc(closing.totalCRC) - Math.trunc(currentBalanceCRC);
+        const diffUSD = Math.trunc(closing.totalUSD) - Math.trunc(currentBalanceUSD);
+        const userNotes = closing.notes.trim();
+
+        const record: DailyClosingRecord = {
+            id: `${Date.now()}`,
+            createdAt,
+            closingDate: closingDateValue.toISOString(),
+            manager: managerName,
+            totalCRC: Math.trunc(closing.totalCRC),
+            totalUSD: Math.trunc(closing.totalUSD),
+            recordedBalanceCRC: Math.trunc(currentBalanceCRC),
+            recordedBalanceUSD: Math.trunc(currentBalanceUSD),
+            diffCRC,
+            diffUSD,
+            notes: userNotes,
+            breakdownCRC: closing.breakdownCRC ?? {},
+            breakdownUSD: closing.breakdownUSD ?? {},
+        };
+
+        setDailyClosings(prev => {
+            const next = [record, ...prev];
+            return next.slice(0, 50);
+        });
+        setDailyClosingsHydrated(true);
+        setDailyClosingModalOpen(false);
+    };
+
     const handleAdminCompanyChange = useCallback((value: string) => {
         if (!isAdminUser) return;
         setAdminCompany(value);
@@ -1698,6 +1944,8 @@ export function FondoSection({
         storageSnapshotRef.current = null;
         setInitialAmount('0');
         setInitialAmountUSD('0');
+        setDailyClosingsHydrated(false);
+        setDailyClosings([]);
         setCurrencyEnabled({ CRC: true, USD: true });
         setMovementModalOpen(false);
         resetFondoForm();
@@ -1720,8 +1968,6 @@ export function FondoSection({
     };
 
     const displayedEntries = useMemo(() => (sortAsc ? [...fondoEntries].slice().reverse() : fondoEntries), [fondoEntries, sortAsc]);
-
-    const dateKeyFromDate = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
     // days that have at least one movement (used to enable/disable dates in the calendar)
     const daysWithMovements = useMemo(() => {
@@ -1790,12 +2036,25 @@ export function FondoSection({
         return base;
     }, [displayedEntries, fromFilter, toFilter, filterProviderCode, filterPaymentType, filterEditedOnly, searchQuery, providersMap, mode]);
 
-    // Pagination: pageSize may be 5,10,15 or 'all'. Default to 10 visible items.
-    const [pageSize, setPageSize] = useState<number | 'all'>(10);
+    const [pageSize, setPageSize] = useState<'daily' | number | 'all'>('daily');
     const [pageIndex, setPageIndex] = useState(0);
+    const [currentDailyKey, setCurrentDailyKey] = useState(() => dateKeyFromDate(new Date()));
+
+    const todayKey = dateKeyFromDate(new Date());
+
+    const earliestEntryKey = useMemo<string | null>(() => {
+        let earliest: string | null = null;
+        filteredEntries.forEach(entry => {
+            const date = new Date(entry.createdAt);
+            if (Number.isNaN(date.getTime())) return;
+            const key = dateKeyFromDate(date);
+            if (!earliest || key < earliest) earliest = key;
+        });
+        return earliest;
+    }, [filteredEntries]);
 
     const totalPages = useMemo(() => {
-        if (pageSize === 'all') return 1;
+        if (pageSize === 'all' || pageSize === 'daily') return 1;
         return Math.max(1, Math.ceil(filteredEntries.length / pageSize));
     }, [filteredEntries.length, pageSize]);
 
@@ -1805,15 +2064,66 @@ export function FondoSection({
     }, [totalPages]);
 
     useEffect(() => {
+        if (pageSize === 'daily') {
+            setPageIndex(0);
+            setCurrentDailyKey(todayKey);
+            return;
+        }
         // whenever user changes pageSize, reset to first page
         setPageIndex(0);
-    }, [pageSize]);
+    }, [pageSize, todayKey]);
 
     const paginatedEntries = useMemo(() => {
         if (pageSize === 'all') return filteredEntries;
+        if (pageSize === 'daily') {
+            return filteredEntries.filter(entry => dateKeyFromDate(new Date(entry.createdAt)) === currentDailyKey);
+        }
         const start = pageIndex * pageSize;
         return filteredEntries.slice(start, start + pageSize);
-    }, [filteredEntries, pageIndex, pageSize]);
+    }, [filteredEntries, pageIndex, pageSize, currentDailyKey]);
+
+    const isDailyMode = pageSize === 'daily';
+
+    const shiftDateKey = useCallback((key: string, delta: number) => {
+        const [yearStr, monthStr, dayStr] = key.split('-');
+        const year = Number(yearStr);
+        const month = Number(monthStr);
+        const day = Number(dayStr);
+        if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return key;
+        const date = new Date(year, month - 1, day);
+        date.setDate(date.getDate() + delta);
+        return dateKeyFromDate(date);
+    }, []);
+
+    const disablePrevButton = isDailyMode ? currentDailyKey >= todayKey : pageIndex <= 0;
+    const disableNextButton = isDailyMode
+        ? (earliestEntryKey ? currentDailyKey <= earliestEntryKey : true)
+        : pageIndex >= totalPages - 1;
+
+    const handlePrevPage = useCallback(() => {
+        if (isDailyMode) {
+            setCurrentDailyKey(prev => {
+                if (prev >= todayKey) return todayKey;
+                const shifted = shiftDateKey(prev, 1);
+                return shifted > todayKey ? todayKey : shifted;
+            });
+            return;
+        }
+        setPageIndex(p => Math.max(0, p - 1));
+    }, [isDailyMode, shiftDateKey, todayKey]);
+
+    const handleNextPage = useCallback(() => {
+        if (isDailyMode) {
+            if (!earliestEntryKey) return;
+            setCurrentDailyKey(prev => {
+                if (prev <= earliestEntryKey) return prev;
+                const shifted = shiftDateKey(prev, -1);
+                return shifted < earliestEntryKey ? earliestEntryKey : shifted;
+            });
+            return;
+        }
+        setPageIndex(p => Math.min(totalPages - 1, p + 1));
+    }, [earliestEntryKey, isDailyMode, shiftDateKey, totalPages]);
 
     // Group visible entries by day (local date). We'll render a date header row per group.
     const groupedByDay = useMemo(() => {
@@ -1846,6 +2156,32 @@ export function FondoSection({
         return `${dd}/${mm}/${yyyy}`;
     };
 
+    const closingsAreLoading = accountKey === 'FondoGeneral' && !dailyClosingsHydrated;
+    const visibleDailyClosings = useMemo(() => {
+        if (accountKey !== 'FondoGeneral') return [] as DailyClosingRecord[];
+        if (!dailyClosingsHydrated) return [] as DailyClosingRecord[];
+        let base = dailyClosings;
+        if (isDailyMode) {
+            base = base.filter(record => {
+                const key = dateKeyFromDate(new Date(record.closingDate));
+                return key === currentDailyKey;
+            });
+        } else if (fromFilter || toFilter) {
+            base = base.filter(record => {
+                const key = dateKeyFromDate(new Date(record.closingDate));
+                if (fromFilter && toFilter) return key >= fromFilter && key <= toFilter;
+                if (fromFilter && !toFilter) return key === fromFilter;
+                if (!fromFilter && toFilter) return key === toFilter;
+                return true;
+            });
+        }
+        return base;
+    }, [accountKey, dailyClosings, dailyClosingsHydrated, isDailyMode, currentDailyKey, fromFilter, toFilter]);
+    const totalDailyClosings = accountKey === 'FondoGeneral' ? dailyClosings.length : 0;
+    const dailyClosingsTitle = isDailyMode
+        ? `Cierres diarios — ${formatGroupLabel(currentDailyKey)}`
+        : 'Cierres diarios recientes';
+
     const companySelectId = `fg-company-select-${namespace}`;
     const showCompanySelector = isAdminUser && (ownerCompaniesLoading || sortedOwnerCompanies.length > 0 || !!ownerCompaniesError);
     const currentCompanyLabel = company || 'Sin empresa seleccionada';
@@ -1859,9 +2195,9 @@ export function FondoSection({
                     <p className="text-sm font-semibold text-[var(--foreground)] truncate" title={currentCompanyLabel}>{currentCompanyLabel}</p>
                     {ownerCompaniesError && <p className="text-xs text-red-500 mt-1">{ownerCompaniesError}</p>}
                 </div>
-                <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2">
                     <label htmlFor={companySelectId} className="text-xs font-medium text-[var(--muted-foreground)]">
-                        Seleccionar empresa
+                        Seleccionar empresas
                     </label>
                     <select
                         id={companySelectId}
@@ -1892,7 +2228,7 @@ export function FondoSection({
                         onClick={openSettings}
                         title="Abrir configuracion del fondo"
                         aria-label="Abrir configuracion del fondo"
-                        className="inline-flex items-center justify-center gap-2 rounded border border-[var(--input-border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--muted)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
+                        className="inline-flex items-center justify-center gap-2 rounded border border-[var(--input-border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--muted)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] sm:self-start"
                     >
                         <Settings className="w-4 h-4" />
                         <span className="hidden sm:inline">Configurar</span>
@@ -1930,19 +2266,19 @@ export function FondoSection({
     }
 
     return (
-        <div id={id} className="mt-6">
+        <div id={id} className="mt-6 w-full max-w-6xl space-y-6 mx-auto">
             {companySelectorPlacement === 'content' && companySelectorContent && (
-                <div className="mb-4 w-full rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)]/70 p-4">
+                <div className="w-full rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)]/70 p-4">
                     {companySelectorContent}
                 </div>
             )}
-            {/* Professional filter bar - centered */}
-            <div className="mb-4 flex w-full flex-col gap-3 pb-3 border-b border-[var(--input-border)]">
-                <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-center">
+
+            <section className="w-full rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)]/70 p-4 space-y-4">
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                     <select
                         value={filterProviderCode}
                         onChange={e => setFilterProviderCode(e.target.value || 'all')}
-                        className="w-full min-w-[220px] px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm text-[var(--muted-foreground)] sm:w-auto"
+                        className="w-full px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm text-[var(--muted-foreground)]"
                         title="Filtrar por proveedor"
                         aria-label="Filtrar por proveedor"
                     >
@@ -1955,14 +2291,26 @@ export function FondoSection({
                     <select
                         value={filterPaymentType}
                         onChange={e => setFilterPaymentType((e.target.value as any) || 'all')}
-                        className="w-full min-w-[200px] px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm text-[var(--muted-foreground)] sm:w-auto"
+                        className="w-full px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm text-[var(--muted-foreground)]"
                         title="Filtrar por tipo"
                         aria-label="Filtrar por tipo"
                     >
                         <option value="all">Todas las categorías</option>
-                        {FONDO_TYPE_OPTIONS.map(opt => (
-                            <option key={opt} value={opt}>{formatMovementType(opt)}</option>
-                        ))}
+                        <optgroup label="Ingresos">
+                            {FONDO_INGRESO_TYPES.map(opt => (
+                                <option key={opt} value={opt}>{formatMovementType(opt)}</option>
+                            ))}
+                        </optgroup>
+                        <optgroup label="Gastos">
+                            {FONDO_GASTO_TYPES.map(opt => (
+                                <option key={opt} value={opt}>{formatMovementType(opt)}</option>
+                            ))}
+                        </optgroup>
+                        <optgroup label="Egresos">
+                            {FONDO_EGRESO_TYPES.map(opt => (
+                                <option key={opt} value={opt}>{formatMovementType(opt)}</option>
+                            ))}
+                        </optgroup>
                     </select>
 
                     <input
@@ -1970,37 +2318,35 @@ export function FondoSection({
                         value={searchQuery}
                         onChange={e => setSearchQuery(e.target.value)}
                         placeholder="Buscar factura, notas o proveedor"
-                        className="w-full px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm text-[var(--muted-foreground)] sm:w-64"
+                        className="w-full px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm text-[var(--muted-foreground)]"
                         aria-label="Buscar movimientos"
                     />
 
-                    <label className="flex w-full items-center justify-center gap-2 text-sm text-[var(--muted-foreground)] sm:w-auto sm:justify-start">
-                        <input type="checkbox" checked={filterEditedOnly} onChange={e => setFilterEditedOnly(e.target.checked)} />
-                        Editados
-                    </label>
-
-                    <button
-                        type="button"
-                        onClick={() => {
-                            setFilterProviderCode('all');
-                            setFilterPaymentType('all');
-                            setFilterEditedOnly(false);
-                            setSearchQuery('');
-                            setFromFilter(null);
-                            setToFilter(null);
-                        }}
-                        className="w-full px-3 py-2 bg-transparent border border-[var(--input-border)] rounded text-sm text-[var(--muted-foreground)] hover:bg-[var(--muted)] text-center sm:w-auto"
-                        title="Limpiar filtros"
-                    >
-                        Limpiar
-                    </button>
+                    <div className="flex items-center justify-between gap-3 rounded border border-dashed border-[var(--input-border)] px-3 py-2 text-sm text-[var(--muted-foreground)]">
+                        <label className="flex items-center gap-2">
+                            <input type="checkbox" checked={filterEditedOnly} onChange={e => setFilterEditedOnly(e.target.checked)} />
+                            Editados
+                        </label>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setFilterProviderCode('all');
+                                setFilterPaymentType('all');
+                                setFilterEditedOnly(false);
+                                setSearchQuery('');
+                                setFromFilter(null);
+                                setToFilter(null);
+                            }}
+                            className="px-3 py-1 text-xs font-semibold uppercase tracking-wide border border-[var(--input-border)] rounded hover:bg-[var(--muted)]"
+                            title="Limpiar filtros"
+                        >
+                            Limpiar
+                        </button>
+                    </div>
                 </div>
-            </div>
 
-            {/* Calendars and Add button - all centered */}
-            <div className="mb-4 flex flex-col gap-3">
-                <div className="flex w-full flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-center">
-                    <div className="flex w-full flex-col gap-2 sm:flex-row sm:w-auto sm:items-center">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--input-border)] pt-3">
+                    <div className="flex flex-1 flex-wrap items-center gap-3 min-w-[260px]">
                         <div className="relative w-full sm:w-auto">
                             <button
                                 type="button"
@@ -2249,14 +2595,13 @@ export function FondoSection({
                     <button
                         type="button"
                         onClick={handleOpenCreateMovement}
-                        className="flex w-full items-center justify-center gap-2 px-4 py-2 text-white rounded fg-add-mov-btn sm:w-auto"
+                        className="flex w-full items-center justify-center gap-2 rounded fg-add-mov-btn px-4 py-2 text-white sm:w-auto"
                     >
                         <Plus className="w-4 h-4" />
                         Agregar movimiento
                     </button>
-                    {/* Settings button moved into the balance card below */}
                 </div>
-            </div>
+            </section>
 
             {!authLoading && !company && (
                 <p className="text-sm text-[var(--muted-foreground)] mb-4">
@@ -2368,6 +2713,46 @@ export function FondoSection({
                     <p className="text-sm text-[var(--muted-foreground)] text-center">No hay movimientos aun.</p>
                 ) : (
                     <div className="overflow-x-auto rounded border border-[var(--input-border)] bg-[#1f262a] text-white">
+                        <div className="px-3 py-2 flex items-center justify-between bg-transparent text-sm text-[var(--muted-foreground)]">
+                            <div className="flex items-center gap-2">
+                                <span>Mostrar</span>
+                                <select
+                                    value={pageSize === 'all' ? 'all' : pageSize === 'daily' ? 'daily' : String(pageSize)}
+                                    onChange={e => {
+                                        const v = e.target.value;
+                                        if (v === 'all') setPageSize('all');
+                                        else if (v === 'daily') setPageSize('daily');
+                                        else setPageSize(Number.parseInt(v, 10) || 10);
+                                    }}
+                                    className="p-1 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm"
+                                >
+                                    <option value="daily">Mostrar diariamente</option>
+                                    <option value="5">5</option>
+                                    <option value="10">10</option>
+                                    <option value="15">15</option>
+                                    <option value="all">Todos</option>
+                                </select>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={handlePrevPage}
+                                    disabled={disablePrevButton}
+                                    className="px-2 py-1 border border-[var(--input-border)] rounded disabled:opacity-50"
+                                >
+                                    Anterior
+                                </button>
+                                <div className="px-2">{isDailyMode ? formatGroupLabel(currentDailyKey) : `Página ${Math.min(pageIndex + 1, totalPages)} de ${totalPages}`}</div>
+                                <button
+                                    type="button"
+                                    onClick={handleNextPage}
+                                    disabled={disableNextButton}
+                                    className="px-2 py-1 border border-[var(--input-border)] rounded disabled:opacity-50"
+                                >
+                                    Siguiente
+                                </button>
+                            </div>
+                        </div>
                         <div className="max-h-[36rem] overflow-y-auto">
                             {(fromFilter || toFilter) && (
                                 <div className="px-3 py-2">
@@ -2375,7 +2760,7 @@ export function FondoSection({
                                         Filtro: {fromFilter ? formatGroupLabel(fromFilter) : '—'}{toFilter ? ` → ${formatGroupLabel(toFilter)}` : ''}
                                         <button
                                             type="button"
-                                            onClick={() => { setFromFilter(null); setToFilter(null); setPageIndex(0); setPageSize(10); }}
+                                            onClick={() => { setFromFilter(null); setToFilter(null); setPageIndex(0); setPageSize('daily'); }}
                                             className="ml-3 px-2 py-1 border border-[var(--input-border)] rounded text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
                                         >
                                             Limpiar filtro
@@ -2491,7 +2876,7 @@ export function FondoSection({
                                             // the newest entry is the first element in fondoEntries (inserted at index 0)
                                             const isMostRecent = fe.id === fondoEntries[0]?.id;
                                             const providerName = providersMap.get(fe.providerCode) ?? fe.providerCode;
-                                            const isEntryEgreso = isEgresoType(fe.paymentType);
+                                            const isEntryEgreso = isEgresoType(fe.paymentType) || isGastoType(fe.paymentType);
                                             const movementAmount = isEntryEgreso ? fe.amountEgreso : fe.amountIngreso;
                                             const entryCurrency = (fe.currency as 'CRC' | 'USD') || 'CRC';
                                             const balanceAfter = entryCurrency === 'USD' ? (balanceAfterByIdUSD.get(fe.id) ?? (Number(initialAmountUSD) || 0)) : (balanceAfterByIdCRC.get(fe.id) ?? (Number(initialAmount) || 0));
@@ -2625,54 +3010,16 @@ export function FondoSection({
                                 ))}
                             </table>
                         </div>
-                        <div className="px-3 py-2 flex items-center justify-between bg-transparent text-sm text-[var(--muted-foreground)]">
-                            <div className="flex items-center gap-2">
-                                <span>Mostrar</span>
-                                <select
-                                    value={pageSize === 'all' ? 'all' : String(pageSize)}
-                                    onChange={e => {
-                                        const v = e.target.value;
-                                        if (v === 'all') setPageSize('all');
-                                        else setPageSize(Number.parseInt(v, 10) || 10);
-                                    }}
-                                    className="p-1 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm"
-                                >
-                                    <option value="5">5</option>
-                                    <option value="10">10</option>
-                                    <option value="15">15</option>
-                                    <option value="all">Todos</option>
-                                </select>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <button
-                                    type="button"
-                                    onClick={() => setPageIndex(p => Math.max(0, p - 1))}
-                                    disabled={pageIndex <= 0}
-                                    className="px-2 py-1 border border-[var(--input-border)] rounded disabled:opacity-50"
-                                >
-                                    Anterior
-                                </button>
-                                <div className="px-2">Página {Math.min(pageIndex + 1, totalPages)} de {totalPages}</div>
-                                <button
-                                    type="button"
-                                    onClick={() => setPageIndex(p => Math.min(totalPages - 1, p + 1))}
-                                    disabled={pageIndex >= totalPages - 1}
-                                    className="px-2 py-1 border border-[var(--input-border)] rounded disabled:opacity-50"
-                                >
-                                    Siguiente
-                                </button>
-                            </div>
-                        </div>
                     </div>
                 )}
             </div>
 
             <div className="mt-5">
                 <div className="flex justify-center">
-                    <div className="w-full max-w-2xl">
+                    <div className="w-full max-w-2xl space-y-4">
                         {enabledBalanceCurrencies.length > 0 && (
                             <div className="px-4 py-3 rounded min-w-[220px] fg-balance-card">
-                                <div className="mb-3 text-center text-sm font-medium text-[var(--muted-foreground)]">Saldo actual</div>
+                                <div className="mb-3 text-center text-sm font-medium text-[var(--muted-foreground)]">Saldo Actual</div>
                                 <div className="flex flex-col divide-y divide-[var(--input-border)] sm:flex-row sm:divide-y-0 sm:divide-x">
                                     {enabledBalanceCurrencies.map(currency => {
                                         const label = currency === 'CRC' ? 'Colones' : 'Dólares';
@@ -2687,6 +3034,129 @@ export function FondoSection({
                                         );
                                     })}
                                 </div>
+                                {accountKey === 'FondoGeneral' && (
+                                    <div className="mt-4 flex justify-center">
+                                        <button
+                                            type="button"
+                                            onClick={handleOpenDailyClosing}
+                                            className="px-4 py-2 rounded border border-[var(--input-border)] text-sm text-[var(--foreground)] hover:bg-[var(--muted)]"
+                                        >
+                                            Registrar cierre diario
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                        {accountKey === 'FondoGeneral' && (
+                            <div className="px-4 py-4 rounded border border-[var(--input-border)] bg-[var(--card-bg)]">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <h3 className="text-sm font-semibold text-[var(--foreground)]">{dailyClosingsTitle}</h3>
+                                    {!closingsAreLoading && totalDailyClosings > 0 && (
+                                        <span className="text-xs text-[var(--muted-foreground)]">
+                                            {isDailyMode
+                                                ? `${visibleDailyClosings.length} ${visibleDailyClosings.length === 1 ? 'cierre' : 'cierres'} en ${formatGroupLabel(currentDailyKey)}`
+                                                : totalDailyClosings >= 50
+                                                    ? 'Mostrando los últimos 50 registros'
+                                                    : `Total guardado: ${totalDailyClosings}`}
+                                        </span>
+                                    )}
+                                </div>
+                                {closingsAreLoading ? (
+                                    <p className="mt-3 text-sm text-[var(--muted-foreground)]">Cargando cierres...</p>
+                                ) : visibleDailyClosings.length === 0 ? (
+                                    <p className="mt-3 text-sm text-[var(--muted-foreground)]">
+                                        {isDailyMode
+                                            ? `No hay cierres registrados para ${formatGroupLabel(currentDailyKey)}.`
+                                            : 'Aún no has registrado cierres diarios para este fondo.'}
+                                    </p>
+                                ) : (
+                                    <div className="mt-4 space-y-4 max-h-[360px] overflow-y-auto pr-1">
+                                        {visibleDailyClosings.map(record => {
+                                            const closingDate = new Date(record.closingDate);
+                                            const closingDateLabel = Number.isNaN(closingDate.getTime())
+                                                ? record.closingDate
+                                                : dailyClosingDateFormatter.format(closingDate);
+                                            const createdAtDate = new Date(record.createdAt);
+                                            const createdAtLabel = Number.isNaN(createdAtDate.getTime())
+                                                ? record.createdAt
+                                                : dateTimeFormatter.format(createdAtDate);
+                                            const crcLines = buildBreakdownLines('CRC', record.breakdownCRC);
+                                            const usdLines = buildBreakdownLines('USD', record.breakdownUSD);
+                                            const showCRC =
+                                                record.totalCRC !== 0 ||
+                                                record.recordedBalanceCRC !== 0 ||
+                                                record.diffCRC !== 0 ||
+                                                crcLines.length > 0;
+                                            const showUSD =
+                                                record.totalUSD !== 0 ||
+                                                record.recordedBalanceUSD !== 0 ||
+                                                record.diffUSD !== 0 ||
+                                                usdLines.length > 0;
+                                            return (
+                                                <div
+                                                    key={record.id}
+                                                    className="rounded border border-[var(--input-border)] bg-[var(--muted)]/10 p-4"
+                                                >
+                                                    <div className="flex flex-wrap items-start justify-between gap-3">
+                                                        <div>
+                                                            <div className="text-sm font-semibold text-[var(--foreground)]">{closingDateLabel}</div>
+                                                            <div className="text-xs text-[var(--muted-foreground)]">Registrado: {createdAtLabel}</div>
+                                                        </div>
+                                                        <div className="text-xs text-[var(--muted-foreground)]">
+                                                            Encargado:{' '}
+                                                            <span className="font-medium text-[var(--foreground)]">{record.manager || '—'}</span>
+                                                        </div>
+                                                    </div>
+                                                    <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                                        <div className="rounded border border-[var(--input-border)]/60 bg-[var(--muted)]/10 p-3">
+                                                            <div className="text-xs uppercase tracking-wide text-[var(--muted-foreground)]">Colones</div>
+                                                            {showCRC ? (
+                                                                <div className="mt-2 space-y-1 text-sm text-[var(--foreground)]">
+                                                                    <div>Conteo: {formatByCurrency('CRC', record.totalCRC)}</div>
+                                                                    <div>Saldo registrado: {formatByCurrency('CRC', record.recordedBalanceCRC)}</div>
+                                                                    <div className={getDailyClosingDiffClass(record.diffCRC)}>
+                                                                        Diferencia: {formatDailyClosingDiff('CRC', record.diffCRC)}
+                                                                    </div>
+                                                                    {crcLines.length > 0 && (
+                                                                        <div className="pt-1 text-xs text-[var(--muted-foreground)]">
+                                                                            Detalle: {crcLines.join(', ')}
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            ) : (
+                                                                <div className="mt-2 text-xs text-[var(--muted-foreground)]">Sin datos en CRC</div>
+                                                            )}
+                                                        </div>
+                                                        <div className="rounded border border-[var(--input-border)]/60 bg-[var(--muted)]/10 p-3">
+                                                            <div className="text-xs uppercase tracking-wide text-[var(--muted-foreground)]">Dólares</div>
+                                                            {showUSD ? (
+                                                                <div className="mt-2 space-y-1 text-sm text-[var(--foreground)]">
+                                                                    <div>Conteo: {formatByCurrency('USD', record.totalUSD)}</div>
+                                                                    <div>Saldo registrado: {formatByCurrency('USD', record.recordedBalanceUSD)}</div>
+                                                                    <div className={getDailyClosingDiffClass(record.diffUSD)}>
+                                                                        Diferencia: {formatDailyClosingDiff('USD', record.diffUSD)}
+                                                                    </div>
+                                                                    {usdLines.length > 0 && (
+                                                                        <div className="pt-1 text-xs text-[var(--muted-foreground)]">
+                                                                            Detalle: {usdLines.join(', ')}
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            ) : (
+                                                                <div className="mt-2 text-xs text-[var(--muted-foreground)]">Sin datos en USD</div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                    {record.notes && record.notes.length > 0 && (
+                                                        <div className="mt-3 text-xs text-[var(--muted-foreground)]">
+                                                            Notas: {record.notes}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>
@@ -2931,6 +3401,18 @@ export function FondoSection({
                         )}
                     </div>
                 </div>
+            )}
+
+            {accountKey === 'FondoGeneral' && (
+                <DailyClosingModal
+                    open={dailyClosingModalOpen}
+                    onClose={handleCloseDailyClosing}
+                    onConfirm={handleConfirmDailyClosing}
+                    employees={employeeOptions}
+                    loadingEmployees={employeesLoading}
+                    currentBalanceCRC={currentBalanceCRC}
+                    currentBalanceUSD={currentBalanceUSD}
+                />
             )}
         </div>
     );

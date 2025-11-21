@@ -1,25 +1,33 @@
 "use client";
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { 
     FileText, 
     Lock, 
     Calendar,
     Filter,
-    Download,
     Search,
     X,
     TrendingUp,
     TrendingDown,
     DollarSign,
-    Building2
+    Building2,
+    RefreshCw
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { getDefaultPermissions } from '@/utils/permissions';
 import { MovimientosFondosService, MovementAccountKey } from '@/services/movimientos-fondos';
 import { useProviders } from '@/hooks/useProviders';
 import { EmpresasService } from '@/services/empresas';
-import type { Empresas } from '@/types/firestore';
+import type { Empresas, ProviderEntry } from '@/types/firestore';
+
+const ACCOUNT_OPTIONS: Array<{ value: MovementAccountKey | 'all'; label: string }> = [
+    { value: 'all', label: 'Todas las cuentas' },
+    { value: 'FondoGeneral', label: 'Fondo General' },
+    { value: 'BCR', label: 'BCR' },
+    { value: 'BN', label: 'BN' },
+    { value: 'BAC', label: 'BAC' },
+];
 
 // Types from fondo.tsx
 const FONDO_INGRESO_TYPES = ['VENTAS', 'OTROS INGRESOS'] as const;
@@ -70,9 +78,7 @@ const formatDate = (isoString: string) => {
     return new Intl.DateTimeFormat('es-CR', {
         year: 'numeric',
         month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit'
+        day: 'numeric'
     }).format(date);
 };
 
@@ -85,18 +91,22 @@ export default function ReportePage() {
     const ownerId = (user?.ownerId || '').trim();
 
     // Company selection state
-    const [selectedCompany, setSelectedCompany] = useState(assignedCompany);
+    const [selectedCompany, setSelectedCompany] = useState('');
     const [ownerCompanies, setOwnerCompanies] = useState<Empresas[]>([]);
-    const [companiesLoading, setCompaniesLoading] = useState(false);
 
     // Movements data
     const [allMovements, setAllMovements] = useState<FondoEntry[]>([]);
     const [movementsLoading, setMovementsLoading] = useState(false);
+    const [isRefreshing, setIsRefreshing] = useState(false);
     
     // Providers
     const { providers } = useProviders(selectedCompany);
     const providersMap = useMemo(() => {
-        return new Map(providers.map(p => [p.code, p.name]));
+        const map = new Map<string, ProviderEntry>();
+        providers.forEach(provider => {
+            map.set(provider.code, provider);
+        });
+        return map;
     }, [providers]);
 
     // Filter states
@@ -108,6 +118,28 @@ export default function ReportePage() {
     const [selectedCurrency, setSelectedCurrency] = useState<'CRC' | 'USD' | 'all'>('all');
     const [searchQuery, setSearchQuery] = useState('');
     const [filterMode, setFilterMode] = useState<'all' | 'ingreso' | 'egreso'>('all');
+    const [reportType, setReportType] = useState<'all' | 'solo-gastos' | 'gastos-egresos'>('all');
+
+    // Update selectedCompany when assignedCompany becomes available
+    useEffect(() => {
+        if (!isAdminUser && assignedCompany && !selectedCompany) {
+            setSelectedCompany(assignedCompany);
+        }
+    }, [assignedCompany, selectedCompany, isAdminUser]);
+
+    // Align selected company name with canonical owner company entry
+    useEffect(() => {
+        if (!selectedCompany || ownerCompanies.length === 0) return;
+
+        const normalizedSelected = selectedCompany.trim().toLowerCase();
+        const matchedCompany = ownerCompanies.find(company =>
+            (company.name || '').trim().toLowerCase() === normalizedSelected
+        );
+
+        if (matchedCompany?.name && matchedCompany.name !== selectedCompany) {
+            setSelectedCompany(matchedCompany.name.trim());
+        }
+    }, [selectedCompany, ownerCompanies]);
 
     // Load companies for admin users
     useEffect(() => {
@@ -116,7 +148,6 @@ export default function ReportePage() {
             return;
         }
 
-        setCompaniesLoading(true);
         EmpresasService.getAllEmpresas()
             .then(empresas => {
                 const filtered = empresas.filter(emp => (emp.ownerId || '').trim() === ownerId);
@@ -124,26 +155,59 @@ export default function ReportePage() {
                     (a.name || '').localeCompare(b.name || '', 'es', { sensitivity: 'base' })
                 ));
             })
-            .catch(err => console.error('Error loading companies:', err))
-            .finally(() => setCompaniesLoading(false));
+            .catch(err => console.error('Error loading companies:', err));
     }, [isAdminUser, ownerId]);
+
+    const fetchCompanyStorage = useCallback(async (companyName: string) => {
+        const normalized = (companyName || '').trim();
+        if (!normalized) {
+            return { storage: null, effectiveName: '' };
+        }
+
+        const variants = Array.from(new Set([
+            normalized,
+            normalized.toUpperCase(),
+            normalized.toLowerCase(),
+        ]));
+
+        for (const variant of variants) {
+            const companyKey = MovimientosFondosService.buildCompanyMovementsKey(variant);
+            try {
+                const storage = await MovimientosFondosService.getDocument<FondoEntry>(companyKey);
+                if (storage) {
+                    return { storage, effectiveName: variant };
+                }
+            } catch (err) {
+                console.error('Error loading movements:', err);
+            }
+        }
+
+        return { storage: null, effectiveName: normalized };
+    }, []);
 
     // Load movements data
     useEffect(() => {
-        if (!selectedCompany) {
+        const targetCompany = selectedCompany.trim();
+        if (!targetCompany) {
             setAllMovements([]);
             return;
         }
 
+        let isActive = true;
+
         const loadMovements = async () => {
             setMovementsLoading(true);
             try {
-                const companyKey = MovimientosFondosService.buildCompanyMovementsKey(selectedCompany);
-                const storage = await MovimientosFondosService.getDocument<FondoEntry>(companyKey);
-                
+                const { storage, effectiveName } = await fetchCompanyStorage(targetCompany);
+                if (!isActive) return;
+
+                if (effectiveName && effectiveName !== selectedCompany) {
+                    setSelectedCompany(effectiveName);
+                }
+
                 if (storage?.operations?.movements) {
                     const movements = storage.operations.movements as FondoEntry[];
-                    setAllMovements(movements.sort((a, b) => 
+                    setAllMovements(movements.sort((a, b) =>
                         new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
                     ));
                 } else {
@@ -151,14 +215,22 @@ export default function ReportePage() {
                 }
             } catch (err) {
                 console.error('Error loading movements:', err);
-                setAllMovements([]);
+                if (isActive) {
+                    setAllMovements([]);
+                }
             } finally {
-                setMovementsLoading(false);
+                if (isActive) {
+                    setMovementsLoading(false);
+                }
             }
         };
 
         void loadMovements();
-    }, [selectedCompany]);
+
+        return () => {
+            isActive = false;
+        };
+    }, [selectedCompany, assignedCompany, fetchCompanyStorage]);
 
     // Apply filters
     const filteredMovements = useMemo(() => {
@@ -203,15 +275,30 @@ export default function ReportePage() {
             filtered = filtered.filter(m => !isIngresoType(m.paymentType));
         }
 
+        // Filter by report type
+        if (reportType === 'solo-gastos') {
+            // Solo gastos específicos (sin egresos bancarios)
+            filtered = filtered.filter(m => 
+                !isIngresoType(m.paymentType) && 
+                !['PAGO TIEMPOS', 'PAGO BANCA'].includes(m.paymentType)
+            );
+        } else if (reportType === 'gastos-egresos') {
+            // Todos los egresos (gastos + egresos)
+            filtered = filtered.filter(m => !isIngresoType(m.paymentType));
+        }
+
         // Search filter
         const query = searchQuery.trim().toLowerCase();
         if (query) {
             filtered = filtered.filter(m => {
-                const providerName = providersMap.get(m.providerCode) ?? '';
+                const providerEntry = providersMap.get(m.providerCode);
+                const providerName = providerEntry?.name?.toLowerCase() ?? '';
+                const providerCategory = providerEntry?.category?.toLowerCase() ?? '';
                 return (
                     m.invoiceNumber.toLowerCase().includes(query) ||
                     m.notes.toLowerCase().includes(query) ||
-                    providerName.toLowerCase().includes(query) ||
+                    providerName.includes(query) ||
+                    providerCategory.includes(query) ||
                     m.manager.toLowerCase().includes(query) ||
                     m.paymentType.toLowerCase().includes(query)
                 );
@@ -220,7 +307,7 @@ export default function ReportePage() {
 
         return filtered;
     }, [allMovements, dateFrom, dateTo, selectedProvider, selectedType, selectedAccount, 
-        selectedCurrency, filterMode, searchQuery, providersMap]);
+        selectedCurrency, filterMode, searchQuery, providersMap, reportType]);
 
     // Calculate totals
     const totals = useMemo(() => {
@@ -240,43 +327,94 @@ export default function ReportePage() {
             .filter(m => m.currency === 'USD' && !isIngresoType(m.paymentType))
             .reduce(( sum, m) => sum + m.amountEgreso, 0);
 
+        // Calculate only expenses (gastos) total
+        const crcGastos = filteredMovements
+            .filter(m => m.currency === 'CRC' && !isIngresoType(m.paymentType) && 
+                !['PAGO TIEMPOS', 'PAGO BANCA'].includes(m.paymentType))
+            .reduce((sum, m) => sum + m.amountEgreso, 0);
+        
+        const usdGastos = filteredMovements
+            .filter(m => m.currency === 'USD' && !isIngresoType(m.paymentType) && 
+                !['PAGO TIEMPOS', 'PAGO BANCA'].includes(m.paymentType))
+            .reduce((sum, m) => sum + m.amountEgreso, 0);
+
         return {
             crcIngresos,
             crcEgresos,
+            crcGastos,
             crcBalance: crcIngresos - crcEgresos,
             usdIngresos,
             usdEgresos,
+            usdGastos,
             usdBalance: usdIngresos - usdEgresos,
         };
     }, [filteredMovements]);
 
-    // Export to CSV
-    const handleExport = () => {
-        if (filteredMovements.length === 0) return;
+    const tableTotals = useMemo(() => {
+        const baseTotals = {
+            ingreso: { CRC: 0, USD: 0 } as Record<'CRC' | 'USD', number>,
+            gasto: { CRC: 0, USD: 0 } as Record<'CRC' | 'USD', number>,
+            egreso: { CRC: 0, USD: 0 } as Record<'CRC' | 'USD', number>,
+        };
 
-        const headers = ['Fecha', 'Cuenta', 'Moneda', 'Proveedor', 'Factura', 'Tipo', 'Ingreso', 'Egreso', 'Encargado', 'Notas'];
-        const rows = filteredMovements.map(m => [
-            formatDate(m.createdAt),
-            m.accountId || 'FondoGeneral',
-            m.currency || 'CRC',
-            providersMap.get(m.providerCode) ?? m.providerCode,
-            m.invoiceNumber,
-            m.paymentType,
-            isIngresoType(m.paymentType) ? m.amountIngreso.toString() : '0',
-            !isIngresoType(m.paymentType) ? m.amountEgreso.toString() : '0',
-            m.manager,
-            m.notes
-        ]);
+        filteredMovements.forEach(movement => {
+            const currency = (movement.currency ?? 'CRC') as 'CRC' | 'USD';
 
-        const csv = [headers, ...rows].map(row => 
-            row.map(cell => `"${cell}"`).join(',')
-        ).join('\n');
+            if (isIngresoType(movement.paymentType)) {
+                baseTotals.ingreso[currency] += movement.amountIngreso;
+                return;
+            }
 
-        const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = `reporte-movimientos-${new Date().toISOString().split('T')[0]}.csv`;
-        link.click();
+            const providerCategory = providersMap.get(movement.providerCode)?.category ?? 'Egreso';
+
+            if (providerCategory === 'Gasto') {
+                baseTotals.gasto[currency] += movement.amountEgreso;
+            } else {
+                baseTotals.egreso[currency] += movement.amountEgreso;
+            }
+        });
+
+        return baseTotals;
+    }, [filteredMovements, providersMap]);
+
+    const formatTotalsByCurrency = (values: Record<'CRC' | 'USD', number>) => {
+        const parts: string[] = [];
+        (['CRC', 'USD'] as const).forEach(currency => {
+            if (values[currency] > 0) {
+                parts.push(formatCurrency(values[currency], currency));
+            }
+        });
+        return parts.length > 0 ? parts.join(' · ') : '-';
+    };
+
+    // Refresh movements manually
+    const handleRefresh = async () => {
+        const targetCompany = selectedCompany.trim();
+        if (!targetCompany || movementsLoading) return;
+
+        setIsRefreshing(true);
+        setMovementsLoading(true);
+        try {
+            const { storage, effectiveName } = await fetchCompanyStorage(targetCompany);
+
+            if (effectiveName && effectiveName !== selectedCompany) {
+                setSelectedCompany(effectiveName);
+            }
+
+            if (storage?.operations?.movements) {
+                const movements = storage.operations.movements as FondoEntry[];
+                setAllMovements(movements.sort((a, b) =>
+                    new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+                ));
+            } else {
+                setAllMovements([]);
+            }
+        } catch (err) {
+            console.error('Error refreshing movements:', err);
+        } finally {
+            setIsRefreshing(false);
+            setMovementsLoading(false);
+        }
     };
 
     // Clear all filters
@@ -289,6 +427,7 @@ export default function ReportePage() {
         setSelectedCurrency('all');
         setSearchQuery('');
         setFilterMode('all');
+        setReportType('all');
     };
 
     const activeFiltersCount = [
@@ -298,7 +437,8 @@ export default function ReportePage() {
         selectedAccount !== 'all',
         selectedCurrency !== 'all',
         searchQuery,
-        filterMode !== 'all'
+        filterMode !== 'all',
+        reportType !== 'all'
     ].filter(Boolean).length;
 
     if (loading) {
@@ -334,27 +474,103 @@ export default function ReportePage() {
                         <h1 className="text-2xl font-bold text-[var(--foreground)]">Reportes de Movimientos</h1>
                     </div>
                     
-                    {isAdminUser && ownerCompanies.length > 0 && (
-                        <div className="flex items-center gap-2">
-                            <Building2 className="w-5 h-5 text-[var(--muted-foreground)]" />
-                            <select
-                                value={selectedCompany}
-                                onChange={(e) => setSelectedCompany(e.target.value)}
-                                className="px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded-lg text-[var(--foreground)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
-                            >
-                                {ownerCompanies.map(company => (
-                                    <option key={company.id} value={company.name}>
-                                        {company.name}
+                    <div className="flex items-center gap-3">
+                        <select
+                            value={selectedAccount}
+                            onChange={(e) => setSelectedAccount(e.target.value as MovementAccountKey | 'all')}
+                            className="px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded-lg text-[var(--foreground)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                            title="Filtrar por cuenta"
+                        >
+                            {ACCOUNT_OPTIONS.map(option => (
+                                <option key={option.value} value={option.value}>
+                                    {option.label}
+                                </option>
+                            ))}
+                        </select>
+                        {isAdminUser && ownerCompanies.length > 0 && (
+                            <div className="flex items-center gap-2">
+                                <Building2 className="w-5 h-5 text-[var(--muted-foreground)]" />
+                                <select
+                                    value={selectedCompany}
+                                    onChange={(e) => setSelectedCompany(e.target.value.trim())}
+                                    className="px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded-lg text-[var(--foreground)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                                >
+                                    <option value="" disabled>
+                                        Seleccionar empresa
                                     </option>
-                                ))}
-                            </select>
+                                    {ownerCompanies.map(company => (
+                                        <option key={company.id} value={company.name}>
+                                            {company.name}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                        )}
+                        
+                        <button
+                            onClick={handleRefresh}
+                            disabled={!selectedCompany || isRefreshing || movementsLoading}
+                            className="flex items-center gap-2 px-4 py-2 bg-[var(--accent)] text-white rounded-lg hover:bg-[var(--accent)]/90 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="Actualizar movimientos"
+                        >
+                            <RefreshCw className={`w-4 h-4 ${(isRefreshing || movementsLoading) ? 'animate-spin' : ''}`} />
+                            <span className="font-medium">Actualizar</span>
+                        </button>
+                    </div>
+                </div>
+
+                {/* Report Type Selector */}
+                <div className="mb-6">
+                    <div className="bg-[var(--muted)] border border-[var(--border)] rounded-lg p-4">
+                        <h2 className="text-sm font-semibold text-[var(--foreground)] mb-3">Tipo de Reporte</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <button
+                                onClick={() => setReportType('all')}
+                                className={`px-4 py-3 rounded-lg font-medium transition-all ${
+                                    reportType === 'all'
+                                        ? 'bg-[var(--accent)] text-white shadow-lg'
+                                        : 'bg-[var(--card-bg)] text-[var(--foreground)] border border-[var(--input-border)] hover:border-[var(--accent)]'
+                                }`}
+                            >
+                                <div className="text-left">
+                                    <div className="font-semibold">Todos los Movimientos</div>
+                                    <div className="text-xs opacity-80 mt-1">Ingresos y egresos completos</div>
+                                </div>
+                            </button>
+                            <button
+                                onClick={() => setReportType('solo-gastos')}
+                                className={`px-4 py-3 rounded-lg font-medium transition-all ${
+                                    reportType === 'solo-gastos'
+                                        ? 'bg-orange-600 text-white shadow-lg'
+                                        : 'bg-[var(--card-bg)] text-[var(--foreground)] border border-[var(--input-border)] hover:border-orange-600'
+                                }`}
+                            >
+                                <div className="text-left">
+                                    <div className="font-semibold">Solo Gastos</div>
+                                    <div className="text-xs opacity-80 mt-1">Gastos operativos únicamente</div>
+                                </div>
+                            </button>
+                            <button
+                                onClick={() => setReportType('gastos-egresos')}
+                                className={`px-4 py-3 rounded-lg font-medium transition-all ${
+                                    reportType === 'gastos-egresos'
+                                        ? 'bg-red-600 text-white shadow-lg'
+                                        : 'bg-[var(--card-bg)] text-[var(--foreground)] border border-[var(--input-border)] hover:border-red-600'
+                                }`}
+                            >
+                                <div className="text-left">
+                                    <div className="font-semibold">Gastos y Egresos</div>
+                                    <div className="text-xs opacity-80 mt-1">Total de salidas de dinero</div>
+                                </div>
+                            </button>
                         </div>
-                    )}
+                    </div>
                 </div>
 
                 {/* Summary Cards */}
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
-                    <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4">
+                    {reportType === 'all' && (
+                        <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4">
                         <div className="flex items-center justify-between mb-2">
                             <span className="text-sm font-medium text-green-700 dark:text-green-400">Ingresos CRC</span>
                             <TrendingUp className="w-5 h-5 text-green-600 dark:text-green-400" />
@@ -363,28 +579,39 @@ export default function ReportePage() {
                             {formatCurrency(totals.crcIngresos, 'CRC')}
                         </p>
                     </div>
+                    )}
 
                     <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4">
                         <div className="flex items-center justify-between mb-2">
-                            <span className="text-sm font-medium text-red-700 dark:text-red-400">Egresos CRC</span>
+                            <span className="text-sm font-medium text-red-700 dark:text-red-400">
+                                {reportType === 'solo-gastos' ? 'Gastos CRC' : 
+                                 reportType === 'gastos-egresos' ? 'Gastos y Egresos CRC' : 
+                                 'Egresos CRC'}
+                            </span>
                             <TrendingDown className="w-5 h-5 text-red-600 dark:text-red-400" />
                         </div>
                         <p className="text-2xl font-bold text-red-800 dark:text-red-300">
-                            {formatCurrency(totals.crcEgresos, 'CRC')}
+                            {formatCurrency(
+                                reportType === 'solo-gastos' ? totals.crcGastos : totals.crcEgresos, 
+                                'CRC'
+                            )}
                         </p>
                     </div>
 
-                    <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
-                        <div className="flex items-center justify-between mb-2">
-                            <span className="text-sm font-medium text-blue-700 dark:text-blue-400">Balance CRC</span>
-                            <DollarSign className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+                    {reportType === 'all' && (
+                        <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
+                            <div className="flex items-center justify-between mb-2">
+                                <span className="text-sm font-medium text-blue-700 dark:text-blue-400">Balance CRC</span>
+                                <DollarSign className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+                            </div>
+                            <p className="text-2xl font-bold text-blue-800 dark:text-blue-300">
+                                {formatCurrency(totals.crcBalance, 'CRC')}
+                            </p>
                         </div>
-                        <p className="text-2xl font-bold text-blue-800 dark:text-blue-300">
-                            {formatCurrency(totals.crcBalance, 'CRC')}
-                        </p>
-                    </div>
+                    )}
 
-                    <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4">
+                    {reportType === 'all' && (
+                        <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4">
                         <div className="flex items-center justify-between mb-2">
                             <span className="text-sm font-medium text-green-700 dark:text-green-400">Ingresos USD</span>
                             <TrendingUp className="w-5 h-5 text-green-600 dark:text-green-400" />
@@ -393,18 +620,27 @@ export default function ReportePage() {
                             {formatCurrency(totals.usdIngresos, 'USD')}
                         </p>
                     </div>
+                    )}
 
                     <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4">
                         <div className="flex items-center justify-between mb-2">
-                            <span className="text-sm font-medium text-red-700 dark:text-red-400">Egresos USD</span>
+                            <span className="text-sm font-medium text-red-700 dark:text-red-400">
+                                {reportType === 'solo-gastos' ? 'Gastos USD' : 
+                                 reportType === 'gastos-egresos' ? 'Gastos y Egresos USD' : 
+                                 'Egresos USD'}
+                            </span>
                             <TrendingDown className="w-5 h-5 text-red-600 dark:text-red-400" />
                         </div>
                         <p className="text-2xl font-bold text-red-800 dark:text-red-300">
-                            {formatCurrency(totals.usdEgresos, 'USD')}
+                            {formatCurrency(
+                                reportType === 'solo-gastos' ? totals.usdGastos : totals.usdEgresos, 
+                                'USD'
+                            )}
                         </p>
                     </div>
 
-                    <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
+                    {reportType === 'all' && (
+                        <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
                         <div className="flex items-center justify-between mb-2">
                             <span className="text-sm font-medium text-blue-700 dark:text-blue-400">Balance USD</span>
                             <DollarSign className="w-5 h-5 text-blue-600 dark:text-blue-400" />
@@ -413,6 +649,7 @@ export default function ReportePage() {
                             {formatCurrency(totals.usdBalance, 'USD')}
                         </p>
                     </div>
+                    )}
                 </div>
 
                 {/* Filters Section */}
@@ -520,11 +757,11 @@ export default function ReportePage() {
                                 onChange={(e) => setSelectedAccount(e.target.value as MovementAccountKey | 'all')}
                                 className="w-full px-3 py-2 bg-[var(--input-bg)] border border-[var(--input-border)] rounded-lg text-[var(--foreground)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
                             >
-                                <option value="all">Todas las cuentas</option>
-                                <option value="FondoGeneral">Fondo General</option>
-                                <option value="BCR">BCR</option>
-                                <option value="BN">BN</option>
-                                <option value="BAC">BAC</option>
+                                {ACCOUNT_OPTIONS.map(option => (
+                                    <option key={option.value} value={option.value}>
+                                        {option.label}
+                                    </option>
+                                ))}
                             </select>
                         </div>
 
@@ -603,19 +840,11 @@ export default function ReportePage() {
                     </div>
                 </div>
 
-                {/* Export Button */}
+                {/* Export Summary */}
                 <div className="flex justify-between items-center mb-4">
                     <p className="text-[var(--muted-foreground)]">
                         Mostrando {filteredMovements.length} de {allMovements.length} movimientos
                     </p>
-                    <button
-                        onClick={handleExport}
-                        disabled={filteredMovements.length === 0}
-                        className="flex items-center gap-2 px-4 py-2 bg-[var(--accent)] text-white rounded-lg hover:bg-[var(--accent)]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                        <Download className="w-4 h-4" />
-                        Exportar CSV
-                    </button>
                 </div>
 
                 {/* Movements Table */}
@@ -627,9 +856,11 @@ export default function ReportePage() {
                     <div className="flex flex-col items-center justify-center py-12 text-center">
                         <FileText className="w-12 h-12 text-[var(--muted-foreground)] mb-3" />
                         <p className="text-[var(--muted-foreground)]">
-                            {allMovements.length === 0 
-                                ? 'No hay movimientos registrados para esta empresa'
-                                : 'No se encontraron movimientos con los filtros aplicados'
+                            {!selectedCompany
+                                ? 'Selecciona una empresa para ver los movimientos disponibles.'
+                                : allMovements.length === 0
+                                    ? 'No hay movimientos registrados para esta empresa'
+                                    : 'No se encontraron movimientos con los filtros aplicados'
                             }
                         </p>
                     </div>
@@ -644,56 +875,82 @@ export default function ReportePage() {
                                     <th className="px-4 py-3 text-left text-sm font-semibold text-[var(--foreground)]">Proveedor</th>
                                     <th className="px-4 py-3 text-left text-sm font-semibold text-[var(--foreground)]">Tipo</th>
                                     <th className="px-4 py-3 text-right text-sm font-semibold text-[var(--foreground)]">Ingreso</th>
+                                    <th className="px-4 py-3 text-right text-sm font-semibold text-[var(--foreground)]">Gasto</th>
                                     <th className="px-4 py-3 text-right text-sm font-semibold text-[var(--foreground)]">Egreso</th>
-                                    <th className="px-4 py-3 text-left text-sm font-semibold text-[var(--foreground)]">Encargado</th>
-                                    <th className="px-4 py-3 text-left text-sm font-semibold text-[var(--foreground)]">Factura</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {filteredMovements.map((movement) => (
-                                    <tr key={movement.id} className="border-b border-[var(--border)] hover:bg-[var(--muted)]/50 transition-colors">
-                                        <td className="px-4 py-3 text-sm text-[var(--foreground)]">
-                                            {formatDate(movement.createdAt)}
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-[var(--foreground)]">
-                                            {movement.accountId || 'FondoGeneral'}
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-[var(--foreground)]">
-                                            {movement.currency || 'CRC'}
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-[var(--foreground)]">
-                                            {providersMap.get(movement.providerCode) ?? movement.providerCode}
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-[var(--foreground)]">
-                                            <span className={`px-2 py-1 rounded text-xs font-medium ${
-                                                isIngresoType(movement.paymentType)
-                                                    ? 'bg-green-500/20 text-green-700 dark:text-green-400'
-                                                    : 'bg-red-500/20 text-red-700 dark:text-red-400'
-                                            }`}>
-                                                {movement.paymentType}
-                                            </span>
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-right font-medium text-green-700 dark:text-green-400">
-                                            {movement.amountIngreso > 0 
-                                                ? formatCurrency(movement.amountIngreso, movement.currency || 'CRC')
-                                                : '-'
-                                            }
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-right font-medium text-red-700 dark:text-red-400">
-                                            {movement.amountEgreso > 0 
-                                                ? formatCurrency(movement.amountEgreso, movement.currency || 'CRC')
-                                                : '-'
-                                            }
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-[var(--foreground)]">
-                                            {movement.manager}
-                                        </td>
-                                        <td className="px-4 py-3 text-sm text-[var(--muted-foreground)]">
-                                            {movement.invoiceNumber || '-'}
-                                        </td>
-                                    </tr>
-                                ))}
+                                {filteredMovements.map((movement) => {
+                                    const providerEntry = providersMap.get(movement.providerCode);
+                                    const providerName = providerEntry?.name ?? movement.providerCode;
+                                    const providerCategory = providerEntry?.category ?? (isIngresoType(movement.paymentType) ? 'Ingreso' : 'Egreso');
+                                    const gastoAmount = providerCategory === 'Gasto' ? movement.amountEgreso : 0;
+                                    const egresoAmount = providerCategory === 'Egreso' ? movement.amountEgreso : 0;
+
+                                    return (
+                                        <tr key={movement.id} className="border-b border-[var(--border)] hover:bg-[var(--muted)]/50 transition-colors">
+                                            <td className="px-4 py-3 text-sm text-[var(--foreground)]">
+                                                {formatDate(movement.createdAt)}
+                                            </td>
+                                            <td className="px-4 py-3 text-sm text-[var(--foreground)]">
+                                                {movement.accountId || 'FondoGeneral'}
+                                            </td>
+                                            <td className="px-4 py-3 text-sm text-[var(--foreground)]">
+                                                {movement.currency || 'CRC'}
+                                            </td>
+                                            <td className="px-4 py-3 text-sm text-[var(--foreground)]">
+                                                <div className="flex flex-col">
+                                                    <span>{providerName}</span>
+                                                    <span className="text-xs text-[var(--muted-foreground)] capitalize">{providerCategory.toLowerCase()}</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-3 text-sm text-[var(--foreground)]">
+                                                <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                                    isIngresoType(movement.paymentType)
+                                                        ? 'bg-green-500/20 text-green-700 dark:text-green-400'
+                                                        : 'bg-red-500/20 text-red-700 dark:text-red-400'
+                                                }`}>
+                                                    {movement.paymentType}
+                                                </span>
+                                            </td>
+                                            <td className="px-4 py-3 text-sm text-right font-medium text-green-700 dark:text-green-400">
+                                                {movement.amountIngreso > 0
+                                                    ? formatCurrency(movement.amountIngreso, movement.currency || 'CRC')
+                                                    : '-'
+                                                }
+                                            </td>
+                                            <td className="px-4 py-3 text-sm text-right font-medium text-red-700 dark:text-red-400">
+                                                {gastoAmount > 0
+                                                    ? formatCurrency(gastoAmount, movement.currency || 'CRC')
+                                                    : '-'
+                                                }
+                                            </td>
+                                            <td className="px-4 py-3 text-sm text-right font-medium text-red-700 dark:text-red-400">
+                                                {egresoAmount > 0
+                                                    ? formatCurrency(egresoAmount, movement.currency || 'CRC')
+                                                    : '-'
+                                                }
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
                             </tbody>
+                            <tfoot>
+                                <tr className="bg-[var(--muted)] border-t border-[var(--border)]">
+                                    <td colSpan={5} className="px-4 py-3 text-sm font-semibold text-[var(--foreground)]">
+                                        Totales
+                                    </td>
+                                    <td className="px-4 py-3 text-sm text-right font-semibold text-green-700 dark:text-green-400">
+                                        {formatTotalsByCurrency(tableTotals.ingreso)}
+                                    </td>
+                                    <td className="px-4 py-3 text-sm text-right font-semibold text-red-700 dark:text-red-400">
+                                        {formatTotalsByCurrency(tableTotals.gasto)}
+                                    </td>
+                                    <td className="px-4 py-3 text-sm text-right font-semibold text-red-700 dark:text-red-400">
+                                        {formatTotalsByCurrency(tableTotals.egreso)}
+                                    </td>
+                                </tr>
+                            </tfoot>
                         </table>
                     </div>
                 )}
