@@ -11,6 +11,8 @@ import {
   Lock,
   Unlock,
   Info,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { EmpresasService } from "../../services/empresas";
 import { SchedulesService } from "../../services/schedules";
@@ -24,6 +26,7 @@ import { storage } from "@/config/firebase";
 import { useAuth } from "../../hooks/useAuth";
 import useToast from "../../hooks/useToast";
 import { hasPermission } from "../../utils/permissions";
+import { useUnlockPastDays } from "../../hooks/useUnlockPastDays";
 
 interface MappedEmpresa {
   id?: string;
@@ -145,7 +148,7 @@ function EmployeeTooltipSummary({
         if (totalHours > 0) {
           // Buscar la configuración específica para esta empresa por nombre
           const companyConfig = ccssConfig?.companie?.find(
-            (comp) => comp.ownerCompanie === empresaName
+            (comp) => comp.ownerCompanie === empresaName,
           );
 
           // Usar horabruta de la configuración CCSS obtenida desde la base de datos
@@ -282,7 +285,7 @@ export default function ControlHorario({
   });
   const [fullMonthView, setFullMonthView] = useState<boolean>(false);
   const [showEmployeeSummary, setShowEmployeeSummary] = useState<string | null>(
-    null
+    null,
   );
   const [confirmModal, setConfirmModal] = useState<{
     open: boolean;
@@ -293,6 +296,9 @@ export default function ControlHorario({
   const [modalLoading, setModalLoading] = useState(false);
   const [editPastDaysEnabled, setEditPastDaysEnabled] = useState(false);
   const [unlockPastDaysModal, setUnlockPastDaysModal] = useState(false);
+  // Estado para la contraseña al desbloquear días pasados (solo rol 'user')
+  const [showUnlockPassword, setShowUnlockPassword] = useState(false);
+  const unlockPastDays = useUnlockPastDays();
   // Estado para exportación y QR
   const [isExporting, setIsExporting] = useState(false);
   const [showQRModal, setShowQRModal] = useState(false);
@@ -324,22 +330,48 @@ export default function ControlHorario({
 
   // notifications handled globally via ToastProvider (showToast)
 
+  // Sincronizar editPastDaysEnabled con el estado del hook de desbloqueo (para rol 'user')
+  useEffect(() => {
+    if (user?.role === "user") {
+      setEditPastDaysEnabled(unlockPastDays.unlocked);
+      return;
+    }
+
+    // Para admin/superadmin: edición libre (sin candado por días pasados)
+    if (user?.role === "admin" || user?.role === "superadmin") {
+      setEditPastDaysEnabled(true);
+    }
+  }, [unlockPastDays.unlocked, user?.role]);
+
+  // Cerrar el modal de contraseña cuando el desbloqueo fue exitoso
+  useEffect(() => {
+    if (unlockPastDays.unlocked && unlockPastDaysModal) {
+      setUnlockPastDaysModal(false);
+    }
+  }, [unlockPastDays.unlocked, unlockPastDaysModal]);
+
   // Verificar si la empresa actual es DELIFOOD
   const isDelifoodEmpresa = empresa.toLowerCase().includes("delifood");
 
   const getIncompletePastDaysForMonth = React.useCallback(
-    (data: ScheduleData, year: number, month: number, today: Date): number[] => {
+    (
+      data: ScheduleData,
+      year: number,
+      month: number,
+      today: Date,
+      startDay: number,
+      endDay: number,
+    ): number[] => {
       const todayKey = new Date(
         today.getFullYear(),
         today.getMonth(),
-        today.getDate()
+        today.getDate(),
       ).getTime();
 
-      const daysInMonth = new Date(year, month + 1, 0).getDate();
       const employeeNames = Object.keys(data);
       const incompleteDays: number[] = [];
 
-      for (let day = 1; day <= daysInMonth; day++) {
+      for (let day = startDay; day <= endDay; day++) {
         const dayKey = new Date(year, month, day).getTime();
         if (dayKey >= todayKey) continue; // solo días anteriores al día actual
 
@@ -358,7 +390,7 @@ export default function ControlHorario({
 
       return incompleteDays;
     },
-    []
+    [],
   );
 
   const formatIncompletePastDaysMessage = React.useCallback(
@@ -370,7 +402,7 @@ export default function ControlHorario({
         rest > 0 ? `${head.join(", ")} (+${rest} más)` : head.join(", ");
       return `Hay ${days.length} día(s) anterior(es) incompleto(s): ${list}. Deben tener ambos turnos N y D asignados.`;
     },
-    []
+    [],
   );
 
   // All useEffect hooks must be declared before any conditional returns
@@ -509,12 +541,12 @@ export default function ControlHorario({
       empresa !== forcedCompanyValue
     ) {
       console.warn(
-        `🚫 BLOQUEO: Usuario "${user?.name}" (rol: user) intentó cambiar a empresa "${empresa}". Forzando regreso a "${forcedCompanyValue}"`
+        `🚫 BLOQUEO: Usuario "${user?.name}" (rol: user) intentó cambiar a empresa "${empresa}". Forzando regreso a "${forcedCompanyValue}"`,
       );
       setEmpresa(forcedCompanyValue);
       showToast(
         `Acceso restringido. Solo puedes ver: ${forcedCompanyValue}`,
-        "error"
+        "error",
       );
     }
   }, [empresa, user, assignedEmpresaValue, assignedEmpresa, showToast]); // Monitorear cambios en empresa y en el valor resuelto para usuarios "user"
@@ -532,7 +564,11 @@ export default function ControlHorario({
       // Determinar rango a consultar (quincena por defecto, mes completo solo si se selecciona)
       const isMonthly = fullMonthView || selectedPeriod === "monthly";
       const startDay = isMonthly ? 1 : selectedPeriod === "1-15" ? 1 : 16;
-      const endDay = isMonthly ? daysInMonth : selectedPeriod === "1-15" ? 15 : daysInMonth;
+      const endDay = isMonthly
+        ? daysInMonth
+        : selectedPeriod === "1-15"
+          ? 15
+          : daysInMonth;
 
       const loadKey = `${empresa}|${year}|${month}|${isDelifoodEmpresa}|${startDay}-${endDay}`;
 
@@ -547,7 +583,7 @@ export default function ControlHorario({
         empresa !== assignedEmpresaValue
       ) {
         console.warn(
-          `🚫 Usuario "${user.name}" (rol: user) intentando acceder a empresa no autorizada: ${empresa}. Empresa asignada (value): ${assignedEmpresaValue}`
+          `🚫 Usuario "${user.name}" (rol: user) intentando acceder a empresa no autorizada: ${empresa}. Empresa asignada (value): ${assignedEmpresaValue}`,
         );
         setEmpresa(String(assignedEmpresaValue));
         showToast("Acceso restringido a tu empresa asignada", "error");
@@ -565,14 +601,14 @@ export default function ControlHorario({
           ? await SchedulesService.getSchedulesByLocationYearMonth(
               empresa,
               year,
-              dbMonth
+              dbMonth,
             )
           : await SchedulesService.getSchedulesByLocationYearMonthDayRange(
               empresa,
               year,
               dbMonth,
               startDay,
-              endDay
+              endDay,
             );
 
         const newScheduleData: ScheduleData = {};
@@ -659,14 +695,27 @@ export default function ControlHorario({
     incompleteDaysToastTimerRef.current = window.setTimeout(() => {
       const year = currentDate.getFullYear();
       const month = currentDate.getMonth();
+
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      const isMonthly = fullMonthView || selectedPeriod === "monthly";
+      const startDay = isMonthly ? 1 : selectedPeriod === "1-15" ? 1 : 16;
+      const endDay = isMonthly
+        ? daysInMonth
+        : selectedPeriod === "1-15"
+          ? 15
+          : daysInMonth;
+
       const incompleteDays = getIncompletePastDaysForMonth(
         scheduleData,
         year,
         month,
-        new Date()
+        new Date(),
+        startDay,
+        endDay,
       );
 
-      // Key persistente para evitar duplicados por StrictMode (double-mount) en dev
+      // Evitar duplicados inmediatos por StrictMode (double-mount) en dev,
+      // pero permitir que al re-entrar más tarde se vuelva a mostrar.
       const storageKey = "controlHorario:lastIncompletePastSignature";
 
       if (incompleteDays.length === 0) {
@@ -679,13 +728,38 @@ export default function ControlHorario({
         return;
       }
 
-      const nextSignature = `${empresa}|${year}|${month}|${incompleteDays.join(",")}`;
+      const nextSignature = `${empresa}|${year}|${month}|${startDay}-${endDay}|${incompleteDays.join(",")}`;
       if (nextSignature === incompletePastDaysSignature) return;
 
       try {
-        const stored = sessionStorage.getItem(storageKey);
-        if (stored === nextSignature) return;
-        sessionStorage.setItem(storageKey, nextSignature);
+        const storedRaw = sessionStorage.getItem(storageKey);
+        const now = Date.now();
+        const DUP_WINDOW_MS = 1500;
+
+        if (storedRaw) {
+          // Nuevo formato: JSON con { sig, at }
+          try {
+            const parsed = JSON.parse(storedRaw) as {
+              sig?: string;
+              at?: number;
+            };
+            if (
+              parsed?.sig === nextSignature &&
+              typeof parsed?.at === "number" &&
+              now - parsed.at < DUP_WINDOW_MS
+            ) {
+              return;
+            }
+          } catch {
+            // Formato antiguo (string plano): no podemos inferir cuándo se mostró,
+            // así que NO bloqueamos; se sobrescribirá con el formato nuevo.
+          }
+        }
+
+        sessionStorage.setItem(
+          storageKey,
+          JSON.stringify({ sig: nextSignature, at: now }),
+        );
       } catch {
         // ignore
       }
@@ -693,7 +767,7 @@ export default function ControlHorario({
       showToast(
         formatIncompletePastDaysMessage(incompleteDays),
         "warning",
-        30000
+        30000,
       );
       setIncompletePastDaysSignature(nextSignature);
     }, 250);
@@ -714,6 +788,8 @@ export default function ControlHorario({
     formatIncompletePastDaysMessage,
     showToast,
     incompletePastDaysSignature,
+    selectedPeriod,
+    fullMonthView,
   ]);
 
   // --- AUTO-QUINCENA: Detectar y mostrar la quincena actual SOLO al cargar el mes actual por PRIMERA VEZ en la sesión ---
@@ -792,13 +868,13 @@ export default function ControlHorario({
       const forced =
         assignedEmpresaValue || assignedEmpresa || "tu empresa asignada";
       console.warn(
-        `🚫 BLOQUEO: Usuario "${user?.name}" (rol: user) intentó cambiar empresa a "${newEmpresa}". Manteniendo: ${forced}`
+        `🚫 BLOQUEO: Usuario "${user?.name}" (rol: user) intentó cambiar empresa a "${newEmpresa}". Manteniendo: ${forced}`,
       );
       showToast("No tienes permisos para cambiar de empresa", "error");
       return;
     }
     console.log(
-      `✅ Cambio de empresa autorizado para usuario "${user?.name}" (rol: ${user?.role}): ${newEmpresa}`
+      `✅ Cambio de empresa autorizado para usuario "${user?.name}" (rol: ${user?.role}): ${newEmpresa}`,
     );
     setEmpresa(newEmpresa);
   };
@@ -841,7 +917,7 @@ export default function ControlHorario({
   const updateScheduleCell = async (
     employeeName: string,
     day: string,
-    newValue: string
+    newValue: string,
   ) => {
     const currentValue = scheduleData[employeeName]?.[day] || "";
 
@@ -858,12 +934,12 @@ export default function ControlHorario({
       const existingEmployee = Object.keys(scheduleData).find(
         (employee) =>
           employee !== employeeName &&
-          scheduleData[employee]?.[day] === newValue
+          scheduleData[employee]?.[day] === newValue,
       );
       if (existingEmployee) {
         showToast(
           `No se puede asignar el turno "${newValue}". ${existingEmployee} ya tiene este turno el día ${day}.`,
-          "error"
+          "error",
         );
         return;
       }
@@ -873,14 +949,14 @@ export default function ControlHorario({
     if (newValue === "L") {
       const employeesWithL = Object.keys(scheduleData).filter(
         (employee) =>
-          employee !== employeeName && scheduleData[employee]?.[day] === "L"
+          employee !== employeeName && scheduleData[employee]?.[day] === "L",
       );
       if (employeesWithL.length >= 2) {
         showToast(
           `No se puede asignar más turnos "L".\n Ya hay 2 empleados libres el día ${day}: ${employeesWithL.join(
-            ", "
+            ", ",
           )}.`,
-          "error"
+          "error",
         );
         return;
       }
@@ -982,7 +1058,7 @@ export default function ControlHorario({
           "JS Month (0-based):",
           month,
           "- Month name:",
-          new Date(year, month).toLocaleDateString("es-CR", { month: "long" })
+          new Date(year, month).toLocaleDateString("es-CR", { month: "long" }),
         );
         console.log("🧪 TESTING: Sending to DB with JavaScript month:", month);
         console.log("Full save data:", {
@@ -1007,7 +1083,7 @@ export default function ControlHorario({
             horasPorDia: empresas
               .find((e) => e.value === empresa)
               ?.employees?.find((e) => e.name === employeeName)?.hoursPerShift,
-          }
+          },
         );
 
         // Actualizar estado local de forma inmutable
@@ -1022,7 +1098,7 @@ export default function ControlHorario({
         if (newValue === "" || newValue.trim() === "") {
           showToast(
             "Turno eliminado correctamente (documento borrado)",
-            "success"
+            "success",
           );
         } else {
           showToast("Horario actualizado correctamente", "success");
@@ -1059,7 +1135,7 @@ export default function ControlHorario({
     if (isUserAdmin()) {
       baseOptions.push(
         { value: "V", label: "V", color: "#28a745", textColor: "#FFF" }, // Verde para Vacaciones
-        { value: "I", label: "I", color: "#fd7e14", textColor: "#FFF" } // Naranja para Incapacidad
+        { value: "I", label: "I", color: "#fd7e14", textColor: "#FFF" }, // Naranja para Incapacidad
       );
     }
 
@@ -1097,12 +1173,47 @@ export default function ControlHorario({
           color: "var(--foreground)",
         };
   };
+
+  const getStartOfCurrentQuincena = (reference: Date = new Date()) => {
+    const ref = new Date(
+      reference.getFullYear(),
+      reference.getMonth(),
+      reference.getDate(),
+    );
+    return new Date(
+      ref.getFullYear(),
+      ref.getMonth(),
+      ref.getDate() <= 15 ? 1 : 16,
+    );
+  };
+
+  const formatDateShort = (date: Date) => {
+    return date.toLocaleDateString("es-CR", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  };
   // Función para manejar cambios en las celdas
   const handleCellChange = (
     employeeName: string,
     day: number,
-    value: string
+    value: string,
   ) => {
+    // Regla dura SOLO para rol 'user': no permitir editar fechas de quincenas anteriores a la quincena actual (según HOY).
+    if (user?.role === "user") {
+      const cellDate = new Date(year, month, day);
+      cellDate.setHours(0, 0, 0, 0);
+      const quincenaStart = getStartOfCurrentQuincena();
+      if (cellDate < quincenaStart) {
+        showToast(
+          `No se puede editar ${formatDateShort(cellDate)} porque pertenece a una quincena pasada. Solo se permite editar desde ${formatDateShort(quincenaStart)}.`,
+          "warning",
+        );
+        return;
+      }
+    }
+
     const currentValue = scheduleData[employeeName]?.[day.toString()] || "";
 
     // Prevenir cambios en celdas V/I por usuarios regulares
@@ -1110,7 +1221,7 @@ export default function ControlHorario({
       const stateName = currentValue === "V" ? "Vacaciones" : "Incapacidad";
       showToast(
         `Solo usuarios ADMIN pueden modificar estados de "${stateName}".`,
-        "error"
+        "error",
       );
       return;
     }
@@ -1120,6 +1231,20 @@ export default function ControlHorario({
 
   // Funciones para DELIFOOD
   const handleDelifoodCellClick = (employeeName: string, day: number) => {
+    // Regla dura SOLO para rol 'user': no permitir editar fechas de quincenas anteriores a la quincena actual (según HOY).
+    if (user?.role === "user") {
+      const cellDate = new Date(year, month, day);
+      cellDate.setHours(0, 0, 0, 0);
+      const quincenaStart = getStartOfCurrentQuincena();
+      if (cellDate < quincenaStart) {
+        showToast(
+          `No se puede editar ${formatDateShort(cellDate)} porque pertenece a una quincena pasada. Solo se permite editar desde ${formatDateShort(quincenaStart)}.`,
+          "warning",
+        );
+        return;
+      }
+    }
+
     const currentHours =
       delifoodHoursData[employeeName]?.[day.toString()]?.hours || 0;
     setDelifoodModal({
@@ -1132,6 +1257,20 @@ export default function ControlHorario({
 
   const handleDelifoodHoursSave = async (hours: number) => {
     const { employeeName, day } = delifoodModal;
+
+    // Defensa extra SOLO para rol 'user': bloquear guardado si pertenece a quincena pasada.
+    if (user?.role === "user") {
+      const cellDate = new Date(year, month, day);
+      cellDate.setHours(0, 0, 0, 0);
+      const quincenaStart = getStartOfCurrentQuincena();
+      if (cellDate < quincenaStart) {
+        showToast(
+          `No se puede editar ${formatDateShort(cellDate)} porque pertenece a una quincena pasada. Solo se permite editar desde ${formatDateShort(quincenaStart)}.`,
+          "warning",
+        );
+        return;
+      }
+    }
 
     console.log("🧪 TESTING: Guardando horas con JavaScript month:", {
       empresa,
@@ -1154,7 +1293,7 @@ export default function ControlHorario({
         year,
         month, // Usar JavaScript month (0-11) para consistencia
         day,
-        hours
+        hours,
       );
 
       console.log("Horas guardadas en Firebase, actualizando estado local");
@@ -1209,7 +1348,7 @@ export default function ControlHorario({
         "Previous month (JS):",
         prev.getMonth(),
         "- Month name:",
-        prev.toLocaleDateString("es-CR", { month: "long" })
+        prev.toLocaleDateString("es-CR", { month: "long" }),
       );
 
       if (direction === "prev") {
@@ -1223,11 +1362,11 @@ export default function ControlHorario({
         "New month (JS):",
         newDate.getMonth(),
         "- Month name:",
-        newDate.toLocaleDateString("es-CR", { month: "long" })
+        newDate.toLocaleDateString("es-CR", { month: "long" }),
       );
       console.log(
         "Will query DB with month (JavaScript 0-11):",
-        newDate.getMonth()
+        newDate.getMonth(),
       );
 
       return newDate;
@@ -1284,7 +1423,7 @@ export default function ControlHorario({
       ctx.fillText(
         "📅 Control de Horarios - Time Master",
         canvas.width / 2,
-        yPosition
+        yPosition,
       );
       yPosition += 50;
 
@@ -1294,27 +1433,27 @@ export default function ControlHorario({
       const selectedPeriodText = fullMonthView
         ? "Mes Completo"
         : viewMode === "first"
-        ? "Primera Quincena (1-15)"
-        : "Segunda Quincena (16-fin)";
+          ? "Primera Quincena (1-15)"
+          : "Segunda Quincena (16-fin)";
 
       ctx.fillText(
         `📍 Empresa: ${
           empresas.find((l) => l.value === empresa)?.label || empresa
         }`,
         canvas.width / 2,
-        yPosition
+        yPosition,
       );
       yPosition += 35;
       ctx.fillText(
         `📅 Período: ${monthName} - ${selectedPeriodText}`,
         canvas.width / 2,
-        yPosition
+        yPosition,
       );
       yPosition += 35;
       ctx.fillText(
         `👤 Exportado por: ${user?.name} (SuperAdmin)`,
         canvas.width / 2,
-        yPosition
+        yPosition,
       );
       yPosition += 35;
       ctx.fillText(
@@ -1327,7 +1466,7 @@ export default function ControlHorario({
           minute: "2-digit",
         })}`,
         canvas.width / 2,
-        yPosition
+        yPosition,
       );
 
       yPosition += 60;
@@ -1350,7 +1489,7 @@ export default function ControlHorario({
       ctx.fillText(
         "Empleado",
         marginX + employeeNameWidth / 2,
-        tableStartY + cellHeight / 2 + 6
+        tableStartY + cellHeight / 2 + 6,
       );
 
       // Encabezados de días
@@ -1368,7 +1507,7 @@ export default function ControlHorario({
         ctx.fillText(
           day.toString(),
           x + cellWidth / 2,
-          tableStartY + cellHeight / 2 + 6
+          tableStartY + cellHeight / 2 + 6,
         );
       });
 
@@ -1379,20 +1518,20 @@ export default function ControlHorario({
         workedDaysHeaderX,
         tableStartY,
         workedDaysColumnWidth,
-        cellHeight
+        cellHeight,
       );
       ctx.strokeRect(
         workedDaysHeaderX,
         tableStartY,
         workedDaysColumnWidth,
-        cellHeight
+        cellHeight,
       );
       ctx.fillStyle = "#1f2937";
       const headerText = isDelifoodEmpresa ? "Total Horas" : "Días Trab.";
       ctx.fillText(
         headerText,
         workedDaysHeaderX + workedDaysColumnWidth / 2,
-        tableStartY + cellHeight / 2 + 6
+        tableStartY + cellHeight / 2 + 6,
       );
       daysToShow.forEach((day, index) => {
         const x = daysStartX + index * cellWidth;
@@ -1407,7 +1546,7 @@ export default function ControlHorario({
         ctx.fillText(
           day.toString(),
           x + cellWidth / 2,
-          tableStartY + cellHeight / 2 + 6
+          tableStartY + cellHeight / 2 + 6,
         );
       });
 
@@ -1443,7 +1582,7 @@ export default function ControlHorario({
         ctx.fillText(
           employeeName,
           marginX + 10,
-          yPosition + cellHeight / 2 + 6
+          yPosition + cellHeight / 2 + 6,
         );
 
         // Celdas de horarios
@@ -1478,7 +1617,7 @@ export default function ControlHorario({
               ctx.fillText(
                 hours.toString(),
                 x + cellWidth / 2,
-                yPosition + cellHeight / 2 + 6
+                yPosition + cellHeight / 2 + 6,
               );
             }
           } else {
@@ -1520,7 +1659,7 @@ export default function ControlHorario({
               ctx.fillText(
                 shift,
                 x + cellWidth / 2,
-                yPosition + cellHeight / 2 + 6
+                yPosition + cellHeight / 2 + 6,
               );
             }
           }
@@ -1533,13 +1672,13 @@ export default function ControlHorario({
           summaryCellX,
           yPosition,
           workedDaysColumnWidth,
-          cellHeight
+          cellHeight,
         );
         ctx.strokeRect(
           summaryCellX,
           yPosition,
           workedDaysColumnWidth,
-          cellHeight
+          cellHeight,
         );
 
         ctx.fillStyle = "#1565c0"; // Color azul para resaltar
@@ -1551,7 +1690,7 @@ export default function ControlHorario({
         ctx.fillText(
           displayValue,
           summaryCellX + workedDaysColumnWidth / 2,
-          yPosition + cellHeight / 2 + 6
+          yPosition + cellHeight / 2 + 6,
         );
 
         yPosition += cellHeight;
@@ -1626,7 +1765,7 @@ export default function ControlHorario({
       ctx.fillText(
         "Generated by Time Master - Control de Horarios",
         canvas.width / 2,
-        yPosition
+        yPosition,
       );
       const summaryText = isDelifoodEmpresa
         ? "Horas mostradas"
@@ -1634,12 +1773,12 @@ export default function ControlHorario({
       ctx.fillText(
         `Total de empleados: ${names.length} | ${summaryText}: ${dayCount}`,
         canvas.width / 2,
-        yPosition + 20
+        yPosition + 20,
       );
       ctx.fillText(
         "⚠️ Documento confidencial - Solo para uso autorizado",
         canvas.width / 2,
-        yPosition + 40
+        yPosition + 40,
       );
 
       // Convertir a imagen y descargar directamente
@@ -1651,7 +1790,7 @@ export default function ControlHorario({
           const filePrefix = isDelifoodEmpresa ? "horas-delifood" : "horarios";
           a.download = `${filePrefix}-${empresa}-${monthName.replace(
             /\s+/g,
-            "_"
+            "_",
           )}-${selectedPeriodText.replace(/\s+/g, "_")}-${
             new Date().toISOString().split("T")[0]
           }.png`;
@@ -1772,7 +1911,7 @@ export default function ControlHorario({
 
       tableHTML += `</tbody></table>`;
       tableHTML += `<div style='margin-top:1.2rem;text-align:right;font-size:0.95rem;opacity:0.7;'>Exportado: ${new Date().toLocaleString(
-        "es-CR"
+        "es-CR",
       )}</div>`;
 
       exportDiv.innerHTML = tableHTML;
@@ -1809,8 +1948,8 @@ export default function ControlHorario({
         selectedPeriod === "monthly"
           ? "mensual"
           : selectedPeriod === "1-15"
-          ? "primera_quincena"
-          : "segunda_quincena";
+            ? "primera_quincena"
+            : "segunda_quincena";
       a.download = `${filePrefix}_${empresa}_${monthName}_${year}_${filenameSuffix}.png`;
       document.body.appendChild(a);
       a.click();
@@ -1838,7 +1977,7 @@ export default function ControlHorario({
   // Si está cargando, mostrar loading
   if (loading) {
     console.log(
-      "⏳ COMPONENTE EN ESTADO LOADING - datos de ubicaciones aún no cargados"
+      "⏳ COMPONENTE EN ESTADO LOADING - datos de ubicaciones aún no cargados",
     );
     return (
       <div className="max-w-4xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-4 sm:p-6">
@@ -1895,7 +2034,7 @@ export default function ControlHorario({
     // Si cualquier usuario tiene empresa asignada (legacy ownercompanie/location), mostrar loading mientras se establece
     if (assignedEmpresa) {
       console.log(
-        `⏳ MOSTRANDO LOADING para usuario ${user.name} con empresa asignada: ${assignedEmpresa}`
+        `⏳ MOSTRANDO LOADING para usuario ${user.name} con empresa asignada: ${assignedEmpresa}`,
       );
       return (
         <div className="max-w-4xl mx-auto bg-[var(--card-bg)] rounded-lg shadow p-4 sm:p-6">
@@ -2091,7 +2230,23 @@ export default function ControlHorario({
                     return cellDate < now;
                   }) && (
                     <button
-                      onClick={() => setUnlockPastDaysModal(true)}
+                      onClick={() => {
+                        // Para rol 'user': solicitar contraseña al desbloquear, confirmación al bloquear
+                        if (user?.role === "user") {
+                          if (editPastDaysEnabled) {
+                            // Re-bloquear: usar modal de confirmación simple
+                            setUnlockPastDaysModal(true);
+                          } else {
+                            // Desbloquear: abrir modal de contraseña
+                            unlockPastDays.setPassword("");
+                            setShowUnlockPassword(false);
+                            setUnlockPastDaysModal(true);
+                          }
+                        } else {
+                          // Admin/superadmin: comportamiento original sin contraseña
+                          setUnlockPastDaysModal(true);
+                        }
+                      }}
                       className="ml-2 p-1 rounded-full border border-gray-400 dark:border-gray-600 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
                       title={
                         editPastDaysEnabled
@@ -2394,7 +2549,7 @@ export default function ControlHorario({
                         <button
                           onClick={() =>
                             setShowEmployeeSummary(
-                              showEmployeeSummary === name ? null : name
+                              showEmployeeSummary === name ? null : name,
                             )
                           }
                           className="sm:hidden flex items-center justify-center w-5 h-5 rounded-full bg-blue-100 hover:bg-blue-200 dark:bg-blue-900/30 dark:hover:bg-blue-800/50 text-blue-600 dark:text-blue-400 transition-colors"
@@ -2433,7 +2588,7 @@ export default function ControlHorario({
                           `📋 Cell value for ${name} day ${day}:`,
                           value,
                           "from scheduleData:",
-                          scheduleData[name]
+                          scheduleData[name],
                         );
                       }
 
@@ -2596,7 +2751,9 @@ export default function ControlHorario({
                 <EmployeeTooltipSummary
                   employeeName={showEmployeeSummary}
                   empresaValue={empresa}
-                  empresaLabel={empresas.find((e) => e.value === empresa)?.label}
+                  empresaLabel={
+                    empresas.find((e) => e.value === empresa)?.label
+                  }
                   employeeConfig={empresas
                     .find((e) => e.value === empresa)
                     ?.employees?.find((e) => e.name === showEmployeeSummary)}
@@ -2633,21 +2790,138 @@ export default function ControlHorario({
       />
 
       {/* Modal para desbloquear días pasados */}
-      <ConfirmModal
-        open={unlockPastDaysModal}
-        message={
-          editPastDaysEnabled
-            ? "¿Quieres volver a bloquear la edición de días pasados?"
-            : "¿Quieres desbloquear la edición de días pasados?"
-        }
-        loading={false}
-        actionType={editPastDaysEnabled ? "delete" : "assign"}
-        onConfirm={() => {
-          setEditPastDaysEnabled((e) => !e);
-          setUnlockPastDaysModal(false);
-        }}
-        onCancel={() => setUnlockPastDaysModal(false)}
-      />
+      {/* Para rol 'user' y desbloqueando: modal con contraseña */}
+      {unlockPastDaysModal && user?.role === "user" && !editPastDaysEnabled ? (
+        <div
+          className="fixed inset-0 z-[99999] flex items-center justify-center bg-black/60 dark:bg-black/80"
+          style={{ pointerEvents: "auto" }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div
+            className="bg-[var(--card-bg)] text-[var(--foreground)] rounded-lg shadow-2xl p-4 sm:p-6 w-full max-w-xs sm:max-w-sm border border-[var(--input-border)] flex flex-col items-center mx-2 relative"
+            style={{ zIndex: 100000 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex flex-col sm:flex-row items-center gap-2 mb-2 justify-center w-full">
+              <Lock className="h-5 w-5 text-[var(--foreground)] flex-shrink-0" />
+              <h2 className="text-lg font-bold text-center w-full">
+                Confirmar acción
+              </h2>
+            </div>
+            <p className="mb-4 text-sm sm:text-base text-center w-full">
+              ¿Quieres desbloquear la edición de días pasados?
+            </p>
+            <p className="mb-3 text-sm text-center text-[var(--muted-foreground)]">
+              Ingresa tu contraseña para continuar. El desbloqueo durará 5
+              minutos.
+            </p>
+            <div className="w-full mb-3 relative">
+              <input
+                type={showUnlockPassword ? "text" : "password"}
+                value={unlockPastDays.password}
+                onChange={(e) => {
+                  unlockPastDays.setPassword(e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    void unlockPastDays.unlock();
+                  }
+                }}
+                placeholder="Contraseña"
+                className="w-full pr-10 pl-3 py-2 border border-[var(--input-border)] rounded-lg bg-[var(--input-bg)] text-[var(--foreground)] focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                autoFocus
+                disabled={unlockPastDays.submitting}
+              />
+              <button
+                type="button"
+                onClick={() => setShowUnlockPassword((v) => !v)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-indigo-500 transition-colors"
+                tabIndex={-1}
+              >
+                {showUnlockPassword ? (
+                  <EyeOff className="w-4 h-4" />
+                ) : (
+                  <Eye className="w-4 h-4" />
+                )}
+              </button>
+            </div>
+            {unlockPastDays.error && (
+              <p className="text-red-500 text-sm mb-3 text-center">
+                {unlockPastDays.error}
+              </p>
+            )}
+            <div className="flex flex-col sm:flex-row justify-center gap-2 mt-2 w-full">
+              <button
+                className="px-4 py-2 rounded bg-[var(--button-bg)] text-[var(--button-text)] hover:bg-[var(--button-hover)] disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2 justify-center w-full sm:w-auto"
+                onClick={() => {
+                  setUnlockPastDaysModal(false);
+                  unlockPastDays.setPassword("");
+                }}
+                disabled={unlockPastDays.submitting}
+                type="button"
+              >
+                Cancelar
+              </button>
+              <button
+                className="px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-2 justify-center w-full sm:w-auto disabled:opacity-60 disabled:cursor-not-allowed"
+                onClick={() => void unlockPastDays.unlock()}
+                disabled={
+                  unlockPastDays.submitting ||
+                  unlockPastDays.password.length === 0
+                }
+                type="button"
+              >
+                {unlockPastDays.submitting ? (
+                  <svg
+                    className="animate-spin h-4 w-4 mr-1 text-white"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                      fill="none"
+                    />
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
+                    />
+                  </svg>
+                ) : (
+                  <Unlock className="h-4 w-4" />
+                )}
+                Desbloquear
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        /* Para admin/superadmin o cuando está bloqueando: modal de confirmación simple */
+        <ConfirmModal
+          open={unlockPastDaysModal}
+          message={
+            editPastDaysEnabled
+              ? "¿Quieres volver a bloquear la edición de días pasados?"
+              : "¿Quieres desbloquear la edición de días pasados?"
+          }
+          loading={false}
+          actionType={editPastDaysEnabled ? "delete" : "assign"}
+          onConfirm={() => {
+            if (user?.role === "user") {
+              // Para rol 'user' re-bloqueando: usar el hook
+              unlockPastDays.lockNow();
+            } else {
+              setEditPastDaysEnabled((e) => !e);
+            }
+            setUnlockPastDaysModal(false);
+          }}
+          onCancel={() => setUnlockPastDaysModal(false)}
+        />
+      )}
 
       {/* Modal QR para descarga con funcionalidad de descarga de imagen */}
       {showQRModal && (
@@ -2679,7 +2953,7 @@ export default function ControlHorario({
                     } catch (error) {
                       console.error(
                         "Error eliminando archivo de storage:",
-                        error
+                        error,
                       );
                     }
                   }
@@ -2713,11 +2987,11 @@ export default function ControlHorario({
 
                       showToast(
                         "📥 Horario descargado exitosamente",
-                        "success"
+                        "success",
                       );
                     } else {
                       throw new Error(
-                        "No hay imagen disponible para descargar"
+                        "No hay imagen disponible para descargar",
                       );
                     }
                   } catch (error) {

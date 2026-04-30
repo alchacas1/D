@@ -8,6 +8,7 @@ interface ConfirmModalProps {
   confirmText?: string;
   cancelText?: string;
   loading?: boolean;
+  confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
   actionType?: "assign" | "delete" | "change";
@@ -23,12 +24,27 @@ const ConfirmModal: React.FC<ConfirmModalProps> = ({
   confirmText = "Confirmar",
   cancelText = "Cancelar",
   loading = false,
+  confirmDisabled = false,
   onConfirm,
   onCancel,
   actionType = "assign",
   singleButton = false,
   singleButtonText,
 }) => {
+  React.useEffect(() => {
+    if (!open) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCancel();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [open, onCancel]);
+
   if (!open) return null;
 
   let icon = <CheckCircle2 className="h-5 w-5 text-[var(--foreground)]" />;
@@ -51,12 +67,12 @@ const ConfirmModal: React.FC<ConfirmModalProps> = ({
     <div
       className="fixed inset-0 z-[99999] flex items-center justify-center bg-black/60 dark:bg-black/80"
       style={{ pointerEvents: "auto" }}
-      onClick={e => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
     >
       <div
         className="bg-[var(--card-bg)] text-[var(--foreground)] rounded-lg shadow-2xl p-4 sm:p-6 w-full max-w-xs sm:max-w-sm border border-[var(--input-border)] flex flex-col items-center mx-2 relative"
         style={{ zIndex: 100000 }}
-        onClick={e => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
       >
         <div className="flex flex-col sm:flex-row items-center gap-2 mb-2 justify-center w-full">
           <span className="flex-shrink-0 flex items-center justify-center mb-1 sm:mb-0">
@@ -76,7 +92,7 @@ const ConfirmModal: React.FC<ConfirmModalProps> = ({
               disabled={loading}
               type="button"
             >
-              {cancelIcon}
+              {confirmIcon}
               {singleButtonText || "Cerrar"}
             </button>
           ) : (
@@ -95,11 +111,11 @@ const ConfirmModal: React.FC<ConfirmModalProps> = ({
                   actionType === "delete"
                     ? "bg-red-600 hover:bg-red-700"
                     : actionType === "change"
-                    ? "bg-yellow-500 hover:bg-yellow-600 text-black"
-                    : "bg-indigo-600 hover:bg-indigo-700"
+                      ? "bg-yellow-500 hover:bg-yellow-600 text-black"
+                      : "bg-indigo-600 hover:bg-indigo-700"
                 }`}
                 onClick={onConfirm}
-                disabled={loading}
+                disabled={loading || confirmDisabled}
                 type="button"
               >
                 {loading ? (

@@ -42,20 +42,18 @@ import {
 import { useAuth } from "../../../hooks/useAuth";
 import { useProviders } from "../../../hooks/useProviders";
 import useToast from "../../../hooks/useToast";
-import type {
-  UserPermissions,
-  Empresas,
-  User,
-} from "../../../types/firestore";
+import type { UserPermissions, Empresas, User } from "../../../types/firestore";
 import { getDefaultPermissions } from "../../../utils/permissions";
 import ConfirmModal from "../../../components/ui/ConfirmModal";
 import DailyClosingHistoryModal from "../../../components/modals/DailyClosingHistoryModal";
 import { EmpresasService } from "../../../services/empresas";
 import { UsersService } from "../../../services/users";
+import { ProvidersService } from "../../../services/providers";
 import { FondoMovementTypesService } from "../../../services/fondo-movement-types";
 import { SchedulesService } from "../../../services/schedules";
 import { generateMovementNotificationEmail } from "../../../services/email-templates/notificacion-movimiento";
 import { generateEgresoProviderCreatedEmail } from "../../../services/email-templates/proveedor-egreso-creado";
+import { AuditHistoryModal } from "./AuditHistoryModal";
 import {
   MovimientosFondosService,
   MovementAccountKey,
@@ -63,6 +61,11 @@ import {
   MovementStorage,
   MovementStorageState,
 } from "../../../services/movimientos-fondos";
+import {
+  ReportesMovimientosService,
+  ReporteMovimientosDetailItem,
+  type ReporteMovimientoCurrency,
+} from "../../../services/reportes-movimientos";
 import {
   DailyClosingsService,
   DailyClosingRecord,
@@ -74,10 +77,16 @@ import DailyClosingModal, { DailyClosingFormValues } from "./DailyClosingModal";
 import { useActorOwnership } from "../../../hooks/useActorOwnership";
 import { db } from "@/config/firebase";
 import { findBestStringMatch } from "../../../utils/stringSimilarity";
-import { dateKeyToISODate, dateToKey, isoDateToDateKey } from "../../../utils/dateKey";
+import {
+  dateKeyToISODate,
+  dateToKey,
+  isoDateToDateKey,
+} from "../../../utils/dateKey";
 import {
   addDoc,
   collection,
+  doc,
+  runTransaction,
   serverTimestamp,
   type QueryDocumentSnapshot,
   type DocumentData,
@@ -104,6 +113,8 @@ const AUTO_ADJUSTMENT_MANAGER = "SISTEMA";
 
 const CIERRE_FONDO_VENTAS_PROVIDER_NAME = "CIERRE FONDO VENTAS";
 
+type ClosingGuardKind = "FONDO_GENERAL" | "FONDO_VENTAS";
+
 // Helper para verificar si un proveedor es un cierre/ajuste automático
 const isAutoAdjustmentProvider = (code: unknown): boolean =>
   typeof code === "string" &&
@@ -111,7 +122,7 @@ const isAutoAdjustmentProvider = (code: unknown): boolean =>
     code === AUTO_ADJUSTMENT_PROVIDER_CODE_LEGACY);
 
 export const isFondoMovementType = (
-  value: string
+  value: string,
 ): value is FondoMovementType =>
   FONDO_TYPE_OPTIONS.includes(value as FondoMovementType);
 
@@ -160,9 +171,14 @@ export type FondoEntry = {
   manager: string;
   notes: string;
   createdAt: string;
+  // OLAP optimization: company name embedded in movement doc
+  empresa?: string;
   accountId?: MovementAccountKey;
   currency?: "CRC" | "USD";
   breakdown?: Record<number, number>;
+  // Para cierres: saldos al momento del cierre (persistidos en el movimiento)
+  closingBalanceCRC?: number;
+  closingBalanceUSD?: number;
   // audit fields: when an edit is recorded, we create an audit movement
   isAudit?: boolean;
   originalEntryId?: string;
@@ -177,7 +193,7 @@ export type FondoEntry = {
  */
 const getChangedFields = (
   before: any,
-  after: any
+  after: any,
 ): { before: Record<string, any>; after: Record<string, any> } => {
   const changed: { before: Record<string, any>; after: Record<string, any> } = {
     before: {},
@@ -262,17 +278,28 @@ const DAILY_CLOSINGS_STORAGE_PREFIX = "fg_daily_closings";
 
 const buildDailyClosingStorageKey = (
   company: string,
-  account: MovementAccountKey
+  account: MovementAccountKey,
 ) => {
   const normalizedCompany = company.trim().toLowerCase();
-  return `${DAILY_CLOSINGS_STORAGE_PREFIX}_${normalizedCompany || "default"
-    }_${account}`;
+  return `${DAILY_CLOSINGS_STORAGE_PREFIX}_${
+    normalizedCompany || "default"
+  }_${account}`;
 };
 
 const sanitizeMoneyNumber = (value: unknown) => {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return 0;
   return Math.trunc(parsed);
+};
+
+const formatToastWaitTime = (remainingSec: number): string => {
+  const sec = Math.max(1, Math.ceil(Number(remainingSec) || 0));
+  // Requirement: if time is more than 60 seconds, format using minutes.
+  if (sec <= 60) return `${sec}s`;
+  const minutes = Math.floor(sec / 60);
+  const seconds = sec % 60;
+  if (seconds === 0) return `${minutes}min`;
+  return `${minutes}min ${seconds}s`;
 };
 
 const sanitizeBreakdown = (input: unknown): Record<number, number> => {
@@ -293,7 +320,7 @@ type AdjustmentResolutionRemoval = NonNullable<
 >[number];
 
 const sanitizeAdjustmentResolution = (
-  input: unknown
+  input: unknown,
 ): DailyClosingRecord["adjustmentResolution"] | undefined => {
   if (!input || typeof input !== "object") return undefined;
   const candidate = input as Record<string, unknown>;
@@ -341,13 +368,13 @@ const sanitizeAdjustmentResolution = (
 
   if (candidate.postAdjustmentBalanceCRC !== undefined) {
     resolution.postAdjustmentBalanceCRC = sanitizeMoneyNumber(
-      candidate.postAdjustmentBalanceCRC
+      candidate.postAdjustmentBalanceCRC,
     );
   }
 
   if (candidate.postAdjustmentBalanceUSD !== undefined) {
     resolution.postAdjustmentBalanceUSD = sanitizeMoneyNumber(
-      candidate.postAdjustmentBalanceUSD
+      candidate.postAdjustmentBalanceUSD,
     );
   }
 
@@ -371,7 +398,7 @@ const sanitizeDailyClosings = (raw: unknown): DailyClosingRecord[] => {
     const createdAt =
       typeof record.createdAt === "string" ? record.createdAt : closingDate;
     const adjustmentResolution = sanitizeAdjustmentResolution(
-      record.adjustmentResolution
+      record.adjustmentResolution,
     );
     acc.push({
       id,
@@ -404,7 +431,7 @@ const dailyClosingSortValue = (record: DailyClosingRecord): number => {
 
 const mergeDailyClosingRecords = (
   existing: DailyClosingRecord[],
-  incoming: DailyClosingRecord[]
+  incoming: DailyClosingRecord[],
 ): DailyClosingRecord[] => {
   if (
     incoming.length === 0 &&
@@ -416,13 +443,13 @@ const mergeDailyClosingRecords = (
   existing.forEach((record) => map.set(record.id, record));
   incoming.forEach((record) => map.set(record.id, record));
   const sorted = Array.from(map.values()).sort(
-    (a, b) => dailyClosingSortValue(b) - dailyClosingSortValue(a)
+    (a, b) => dailyClosingSortValue(b) - dailyClosingSortValue(a),
   );
   return sorted.slice(0, DailyClosingsService.MAX_RECORDS);
 };
 
 const flattenDailyClosingsDocument = (
-  document: DailyClosingsDocument
+  document: DailyClosingsDocument,
 ): { records: DailyClosingRecord[]; loadedKeys: Set<string> } => {
   const loadedKeys = new Set<string>();
   const aggregated: DailyClosingRecord[] = [];
@@ -434,7 +461,7 @@ const flattenDailyClosingsDocument = (
     });
   });
   aggregated.sort(
-    (a, b) => dailyClosingSortValue(b) - dailyClosingSortValue(a)
+    (a, b) => dailyClosingSortValue(b) - dailyClosingSortValue(a),
   );
   return {
     records: aggregated.slice(0, DailyClosingsService.MAX_RECORDS),
@@ -502,6 +529,17 @@ const coerceNotes = (value: unknown): string => {
   return "";
 };
 
+const coerceTruncNumber = (value: unknown): number | undefined => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.trunc(parsed) : undefined;
+  }
+  return undefined;
+};
+
 const resolveCreatedAt = (value: unknown): string | undefined => {
   if (!value) return undefined;
   if (typeof value === "string") {
@@ -533,13 +571,13 @@ const resolveCreatedAt = (value: unknown): string | undefined => {
 
 const dateKeyFromDate = (d: Date) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-    d.getDate()
+    d.getDate(),
   ).padStart(2, "0")}`;
 
 export const sanitizeFondoEntries = (
   rawEntries: unknown,
   forcedCurrency?: MovementCurrencyKey,
-  forcedAccount?: MovementAccountKey
+  forcedAccount?: MovementAccountKey,
 ): FondoEntry[] => {
   if (!Array.isArray(rawEntries)) return [];
 
@@ -552,6 +590,13 @@ export const sanitizeFondoEntries = (
     const paymentType = normalizeStoredType(entry.paymentType);
     const manager = coerceIdentifier(entry.manager);
     const createdAt = resolveCreatedAt(entry.createdAt);
+
+    const closingBalanceCRC = coerceTruncNumber(
+      (entry as any).closingBalanceCRC,
+    );
+    const closingBalanceUSD = coerceTruncNumber(
+      (entry as any).closingBalanceUSD,
+    );
 
     if (!id || !providerCode || !manager || !createdAt) return acc;
 
@@ -600,6 +645,8 @@ export const sanitizeFondoEntries = (
       manager,
       notes: coerceNotes(entry.notes),
       createdAt,
+      closingBalanceCRC,
+      closingBalanceUSD,
       isAudit: !!entry.isAudit,
       originalEntryId:
         typeof entry.originalEntryId === "string"
@@ -646,6 +693,10 @@ export function ProviderSection({ id }: { id?: string }) {
     }
     return set;
   }, [actorOwnerIds, user?.ownerId]);
+  const allowedOwnerIdsKey = useMemo(
+    () => Array.from(allowedOwnerIds).sort().join("|"),
+    [allowedOwnerIds],
+  );
   const isAdminUser = user?.role === "admin";
   const isSuperAdminUser = user?.role === "superadmin";
   const canSelectCompany = isAdminUser || isSuperAdminUser;
@@ -673,14 +724,60 @@ export function ProviderSection({ id }: { id?: string }) {
   const [ownerCompanies, setOwnerCompanies] = useState<Empresas[]>([]);
   const [ownerCompaniesLoading, setOwnerCompaniesLoading] = useState(false);
   const [ownerCompaniesError, setOwnerCompaniesError] = useState<string | null>(
-    null
+    null,
   );
 
   const sortedOwnerCompanies = useMemo(() => {
-    return ownerCompanies.slice().sort((a, b) =>
-      (a.name || "").localeCompare(b.name || "", "es", {
-        sensitivity: "base",
-      })
+    const normalize = (value: unknown) =>
+      String(value || "")
+        .trim()
+        .toLowerCase();
+
+    // Dedupe by the same value key used in the <option value>
+    const valueKey = (emp: Empresas) =>
+      normalize(emp?.name || emp?.ubicacion || emp?.id || "");
+
+    const score = (emp: Empresas) =>
+      (normalize(emp?.id) ? 2 : 0) +
+      (normalize(emp?.name) ? 1 : 0) +
+      (normalize(emp?.ubicacion) ? 1 : 0);
+
+    const byKey = new Map<string, Empresas>();
+    ownerCompanies.forEach((emp) => {
+      const key = valueKey(emp);
+      if (!key) return;
+      const existing = byKey.get(key);
+      if (!existing || score(emp) > score(existing)) {
+        byKey.set(key, emp);
+      }
+    });
+
+    const deduped = Array.from(byKey.values());
+
+    // If there is a named company for an ubicacion, hide the ubicacion-only entry.
+    const ubicacionesWithNamed = new Set<string>();
+    deduped.forEach((emp) => {
+      const name = normalize(emp?.name);
+      const ubicacion = normalize(emp?.ubicacion);
+      if (name && ubicacion) ubicacionesWithNamed.add(ubicacion);
+    });
+
+    const cleaned = deduped.filter((emp) => {
+      const name = normalize(emp?.name);
+      const ubicacion = normalize(emp?.ubicacion);
+      if (!name && ubicacion && ubicacionesWithNamed.has(ubicacion))
+        return false;
+      return true;
+    });
+
+    return cleaned.sort((a, b) =>
+      (a.name || a.ubicacion || "").localeCompare(
+        b.name || b.ubicacion || "",
+        "es",
+        {
+          sensitivity: "base",
+        },
+      ),
     );
   }, [ownerCompanies]);
 
@@ -702,7 +799,7 @@ export function ProviderSection({ id }: { id?: string }) {
       setOwnerCompanies([]);
       setOwnerCompaniesLoading(false);
       setOwnerCompaniesError(
-        "No se pudo determinar el ownerId asociado a tu cuenta."
+        "No se pudo determinar el ownerId asociado a tu cuenta.",
       );
       return;
     }
@@ -716,10 +813,10 @@ export function ProviderSection({ id }: { id?: string }) {
         if (!isMounted) return;
         const filtered = isAdminUser
           ? empresas.filter((emp) => {
-            const owner = (emp.ownerId || "").trim();
-            if (!owner) return false;
-            return allowedOwnerIds.has(owner);
-          })
+              const owner = (emp.ownerId || "").trim();
+              if (!owner) return false;
+              return allowedOwnerIds.has(owner);
+            })
           : empresas;
         setOwnerCompanies(filtered);
         setAdminCompany((current) => {
@@ -743,7 +840,7 @@ export function ProviderSection({ id }: { id?: string }) {
         setOwnerCompaniesError(
           err instanceof Error
             ? err.message
-            : "No se pudieron cargar las empresas disponibles."
+            : "No se pudieron cargar las empresas disponibles.",
         );
       })
       .finally(() => {
@@ -753,12 +850,12 @@ export function ProviderSection({ id }: { id?: string }) {
     return () => {
       isMounted = false;
     };
-  }, [allowedOwnerIds, canSelectCompany, isAdminUser]);
+  }, [allowedOwnerIdsKey, canSelectCompany, isAdminUser]);
 
   const [providerName, setProviderName] = useState("");
   const [providerType, setProviderType] = useState<FondoMovementType | "">("");
   const [editingProviderCode, setEditingProviderCode] = useState<string | null>(
-    null
+    null,
   );
   const [formError, setFormError] = useState<string | null>(null);
   const [providerTypeError, setProviderTypeError] = useState<string>("");
@@ -781,7 +878,7 @@ export function ProviderSection({ id }: { id?: string }) {
 
   const VISIT_DAY_ORDER = useMemo<ProviderVisitDay[]>(
     () => ["D", "L", "M", "MI", "J", "V", "S"],
-    []
+    [],
   );
   const VISIT_DAY_TITLES = useMemo<Record<ProviderVisitDay, string>>(
     () => ({
@@ -793,7 +890,7 @@ export function ProviderSection({ id }: { id?: string }) {
       V: "Viernes",
       S: "Sábado",
     }),
-    []
+    [],
   );
   const VISIT_FREQUENCY_OPTIONS = useMemo<
     Array<{ value: ProviderVisitFrequency; label: string }>
@@ -804,13 +901,19 @@ export function ProviderSection({ id }: { id?: string }) {
       { value: "22 DIAS", label: "22 días" },
       { value: "MENSUAL", label: "Mensual" },
     ],
-    []
+    [],
   );
 
   const [addVisit, setAddVisit] = useState(false);
-  const [visitCreateDays, setVisitCreateDays] = useState<ProviderVisitDay[]>([]);
-  const [visitReceiveDays, setVisitReceiveDays] = useState<ProviderVisitDay[]>([]);
-  const [visitFrequency, setVisitFrequency] = useState<ProviderVisitFrequency | "">("");
+  const [visitCreateDays, setVisitCreateDays] = useState<ProviderVisitDay[]>(
+    [],
+  );
+  const [visitReceiveDays, setVisitReceiveDays] = useState<ProviderVisitDay[]>(
+    [],
+  );
+  const [visitFrequency, setVisitFrequency] = useState<
+    ProviderVisitFrequency | ""
+  >("");
   const [visitStartDateISO, setVisitStartDateISO] = useState<string>("");
 
   const isCompraInventarioProvider =
@@ -820,16 +923,16 @@ export function ProviderSection({ id }: { id?: string }) {
   const sortVisitDays = useCallback(
     (days: ProviderVisitDay[]) => {
       return [...days].sort(
-        (a, b) => VISIT_DAY_ORDER.indexOf(a) - VISIT_DAY_ORDER.indexOf(b)
+        (a, b) => VISIT_DAY_ORDER.indexOf(a) - VISIT_DAY_ORDER.indexOf(b),
       );
     },
-    [VISIT_DAY_ORDER]
+    [VISIT_DAY_ORDER],
   );
 
   const toggleVisitDay = useCallback(
     (
       day: ProviderVisitDay,
-      setter: React.Dispatch<React.SetStateAction<ProviderVisitDay[]>>
+      setter: React.Dispatch<React.SetStateAction<ProviderVisitDay[]>>,
     ) => {
       setter((prev) => {
         const exists = prev.includes(day);
@@ -837,7 +940,7 @@ export function ProviderSection({ id }: { id?: string }) {
         return sortVisitDays(next);
       });
     },
-    [sortVisitDays]
+    [sortVisitDays],
   );
 
   useEffect(() => {
@@ -899,7 +1002,11 @@ export function ProviderSection({ id }: { id?: string }) {
       string,
       {
         at: number;
-        promise: Promise<Awaited<ReturnType<typeof SchedulesService.getSchedulesByLocationYearMonth>>>;
+        promise: Promise<
+          Awaited<
+            ReturnType<typeof SchedulesService.getSchedulesByLocationYearMonth>
+          >
+        >;
       }
     >
   >(new Map());
@@ -921,12 +1028,12 @@ export function ProviderSection({ id }: { id?: string }) {
       const promise = SchedulesService.getSchedulesByLocationYearMonth(
         locationValue,
         year,
-        month0
+        month0,
       );
       schedulesMonthCacheRef.current.set(key, { at: now, promise });
       return promise;
     },
-    []
+    [],
   );
 
   const getOwnerPrimaryAdminEmailCached = useCallback(
@@ -945,7 +1052,7 @@ export function ProviderSection({ id }: { id?: string }) {
       ownerAdminEmailCacheRef.current.set(normalized, { at: now, promise });
       return promise;
     },
-    []
+    [],
   );
   const [similarConfirmOpen, setSimilarConfirmOpen] = useState(false);
   const [similarConfirmMessage, setSimilarConfirmMessage] =
@@ -986,7 +1093,7 @@ export function ProviderSection({ id }: { id?: string }) {
     if (itemsPerPage === "all") return filteredProviders;
     return filteredProviders.slice(
       (currentPage - 1) * itemsPerPage,
-      currentPage * itemsPerPage
+      currentPage * itemsPerPage,
     );
   }, [filteredProviders, currentPage, itemsPerPage]);
 
@@ -999,7 +1106,7 @@ export function ProviderSection({ id }: { id?: string }) {
     if (typeof window !== "undefined") {
       localStorage.setItem(
         "provider-filter-email",
-        showOnlyWithEmail.toString()
+        showOnlyWithEmail.toString(),
       );
     }
   }, [showOnlyWithEmail]);
@@ -1055,19 +1162,29 @@ export function ProviderSection({ id }: { id?: string }) {
     }
 
     // Otros: si tiene ownerId usarlo, si no (dueño) usar su propio id
-    if (user.ownerId && user.ownerId.trim().length > 0) return user.ownerId.trim();
+    if (user.ownerId && user.ownerId.trim().length > 0)
+      return user.ownerId.trim();
     return (user.id || "").trim();
   }, [adminCompany, canSelectCompany, ownerCompanies, user]);
 
   const sendEgresoProviderCreatedEmailToOwner = useCallback(
-    async (providerName: string, providerType?: FondoMovementType): Promise<void> => {
+    async (
+      providerName: string,
+      providerType?: FondoMovementType,
+    ): Promise<void> => {
       try {
         if (!providerType) return;
         if (!isEgresoType(providerType)) return;
 
-        const resolveCreatedByFromControlHorario = async (createdAtISO: string): Promise<string> => {
-          const fallback =
-            (user?.name?.trim() || user?.email?.trim() || user?.id || "Sistema").toString();
+        const resolveCreatedByFromControlHorario = async (
+          createdAtISO: string,
+        ): Promise<string> => {
+          const fallback = (
+            user?.name?.trim() ||
+            user?.email?.trim() ||
+            user?.id ||
+            "Sistema"
+          ).toString();
 
           const normalizedCompany = (company || "").trim();
           if (!normalizedCompany) return fallback;
@@ -1094,7 +1211,9 @@ export function ProviderSection({ id }: { id?: string }) {
               });
 
               [match?.name, match?.ubicacion, match?.id]
-                .map((v) => (typeof v === "string" ? v.trim() : String(v || "").trim()))
+                .map((v) =>
+                  typeof v === "string" ? v.trim() : String(v || "").trim(),
+                )
                 .filter(Boolean)
                 .forEach((v) => set.add(v));
             }
@@ -1122,7 +1241,12 @@ export function ProviderSection({ id }: { id?: string }) {
           const day = Number(getPart("day"));
           const hour = Number(getPart("hour"));
 
-          if (!Number.isFinite(year) || !Number.isFinite(month1) || !Number.isFinite(day) || !Number.isFinite(hour)) {
+          if (
+            !Number.isFinite(year) ||
+            !Number.isFinite(month1) ||
+            !Number.isFinite(day) ||
+            !Number.isFinite(hour)
+          ) {
             return fallback;
           }
 
@@ -1136,8 +1260,8 @@ export function ProviderSection({ id }: { id?: string }) {
           try {
             const schedulesLists = await Promise.all(
               companyKeysToTry.map((key) =>
-                getMonthlySchedulesCached(key, year, month0)
-              )
+                getMonthlySchedulesCached(key, year, month0),
+              ),
             );
             const monthSchedules = schedulesLists.flat();
 
@@ -1150,16 +1274,22 @@ export function ProviderSection({ id }: { id?: string }) {
 
             const normalizedUserName = (user?.name || "").trim().toLowerCase();
             const direct = normalizedUserName
-              ? matches.find((name) => name.toLowerCase() === normalizedUserName)
+              ? matches.find(
+                  (name) => name.toLowerCase() === normalizedUserName,
+                )
               : undefined;
             if (direct) return direct;
 
             return matches
               .slice()
-              .sort((a, b) => a.localeCompare(b, "es", { sensitivity: "base" }))
-              [0];
+              .sort((a, b) =>
+                a.localeCompare(b, "es", { sensitivity: "base" }),
+              )[0];
           } catch (err) {
-            console.error("[PROVIDER-EGRESO-EMAIL] Error resolving createdBy from schedules:", err);
+            console.error(
+              "[PROVIDER-EGRESO-EMAIL] Error resolving createdBy from schedules:",
+              err,
+            );
             return fallback;
           }
         };
@@ -1189,11 +1319,23 @@ export function ProviderSection({ id }: { id?: string }) {
           createdAt: serverTimestamp(),
         });
       } catch (err) {
-        console.error("[PROVIDER-EGRESO-EMAIL] Error sending owner notification:", err);
+        console.error(
+          "[PROVIDER-EGRESO-EMAIL] Error sending owner notification:",
+          err,
+        );
         // La notificación es secundaria: no bloquear creación del proveedor
       }
     },
-    [adminCompany, canSelectCompany, company, getMonthlySchedulesCached, getOwnerPrimaryAdminEmailCached, notificationOwnerId, ownerCompanies, user]
+    [
+      adminCompany,
+      canSelectCompany,
+      company,
+      getMonthlySchedulesCached,
+      getOwnerPrimaryAdminEmailCached,
+      notificationOwnerId,
+      ownerCompanies,
+      user,
+    ],
   );
 
   // Cargar admins cuando se necesite para notificaciones
@@ -1316,14 +1458,14 @@ export function ProviderSection({ id }: { id?: string }) {
     // Escuchar actualizaciones en tiempo real
     window.addEventListener(
       "fondoMovementTypesUpdated",
-      handleFondoTypesUpdate
+      handleFondoTypesUpdate,
     );
 
     return () => {
       isMounted = false;
       window.removeEventListener(
         "fondoMovementTypesUpdated",
-        handleFondoTypesUpdate
+        handleFondoTypesUpdate,
       );
     };
   }, []);
@@ -1341,7 +1483,7 @@ export function ProviderSection({ id }: { id?: string }) {
             newValue: value,
             oldValue: adminCompany,
             storageArea: localStorage,
-          })
+          }),
         );
       } catch (error) {
         console.error("Error saving selected company to localStorage:", error);
@@ -1360,7 +1502,7 @@ export function ProviderSection({ id }: { id?: string }) {
       setSearchTerm("");
       setItemsPerPage(10);
     },
-    [canSelectCompany, adminCompany]
+    [canSelectCompany, adminCompany],
   );
 
   // provider creation is handled from the drawer UI below
@@ -1382,7 +1524,7 @@ export function ProviderSection({ id }: { id?: string }) {
       setAddNotification(true);
       // Intentar encontrar el admin con ese correo
       const matchingAdmin = adminUsers.find(
-        (admin) => admin.email === prov.correonotifi
+        (admin) => admin.email === prov.correonotifi,
       );
       if (matchingAdmin?.id) {
         setSelectedAdminId(matchingAdmin.id);
@@ -1394,12 +1536,20 @@ export function ProviderSection({ id }: { id?: string }) {
 
     if (prov.visit && (prov.type || "").toUpperCase() === "COMPRA INVENTARIO") {
       setAddVisit(true);
-      setVisitCreateDays((prov.visit.createOrderDays || []) as ProviderVisitDay[]);
-      setVisitReceiveDays((prov.visit.receiveOrderDays || []) as ProviderVisitDay[]);
+      setVisitCreateDays(
+        (prov.visit.createOrderDays || []) as ProviderVisitDay[],
+      );
+      setVisitReceiveDays(
+        (prov.visit.receiveOrderDays || []) as ProviderVisitDay[],
+      );
       setVisitFrequency((prov.visit.frequency || "") as ProviderVisitFrequency);
 
       const startKey = (prov.visit as any).startDateKey;
-      if (typeof startKey === "number" && Number.isFinite(startKey) && startKey > 0) {
+      if (
+        typeof startKey === "number" &&
+        Number.isFinite(startKey) &&
+        startKey > 0
+      ) {
         setVisitStartDateISO(dateKeyToISODate(startKey));
       } else {
         setVisitStartDateISO("");
@@ -1518,7 +1668,9 @@ export function ProviderSection({ id }: { id?: string }) {
               <select
                 id={companySelectId}
                 value={adminCompany}
-                onChange={(event) => handleAdminCompanyChange(event.target.value)}
+                onChange={(event) =>
+                  handleAdminCompanyChange(event.target.value)
+                }
                 disabled={
                   ownerCompaniesLoading || sortedOwnerCompanies.length === 0
                 }
@@ -1537,7 +1689,9 @@ export function ProviderSection({ id }: { id?: string }) {
                     ) {
                       return `${name} (${ubicacion})`;
                     }
-                    return name || ubicacion || getCompanyKey(emp) || "Sin nombre";
+                    return (
+                      name || ubicacion || getCompanyKey(emp) || "Sin nombre"
+                    );
                   };
 
                   return (
@@ -1765,14 +1919,23 @@ export function ProviderSection({ id }: { id?: string }) {
 
                           <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] sm:text-xs text-[var(--muted-foreground)]">
                             <span className="inline-flex items-center rounded-full border border-[var(--input-border)] bg-[var(--input-bg)] px-2 py-0.5">
-                              Código: <span className="ml-1 text-[var(--foreground)]">{p.code}</span>
+                              Código:{" "}
+                              <span className="ml-1 text-[var(--foreground)]">
+                                {p.code}
+                              </span>
                             </span>
                             <span className="inline-flex items-center rounded-full border border-[var(--input-border)] bg-[var(--card-bg)]/25 px-2 py-0.5">
-                              Empresa: <span className="ml-1 text-[var(--foreground)]">{p.company}</span>
+                              Empresa:{" "}
+                              <span className="ml-1 text-[var(--foreground)]">
+                                {p.company}
+                              </span>
                             </span>
                             {p.type && (
                               <span className="inline-flex items-center rounded-full border border-[var(--input-border)] bg-[var(--card-bg)]/25 px-2 py-0.5">
-                                Tipo: <span className="ml-1 text-[var(--foreground)]">{p.type}</span>
+                                Tipo:{" "}
+                                <span className="ml-1 text-[var(--foreground)]">
+                                  {p.type}
+                                </span>
                               </span>
                             )}
                             {p.category && (
@@ -1825,8 +1988,9 @@ export function ProviderSection({ id }: { id?: string }) {
       <ConfirmModal
         open={confirmState.open}
         title="Eliminar proveedor"
-        message={`Quieres eliminar el proveedor "${confirmState.name || confirmState.code
-          }"? Esta accion no se puede deshacer.`}
+        message={`Quieres eliminar el proveedor "${
+          confirmState.name || confirmState.code
+        }"? Esta accion no se puede deshacer.`}
         confirmText="Eliminar"
         cancelText="Cancelar"
         actionType="delete"
@@ -1860,19 +2024,19 @@ export function ProviderSection({ id }: { id?: string }) {
                 pending.name,
                 pending.providerType,
                 pending.correonotifi,
-                pending.visit
+                pending.visit,
               );
             } else {
               await addProvider(
                 pending.name,
                 pending.providerType,
                 pending.correonotifi,
-                pending.visit
+                pending.visit,
               );
 
               await sendEgresoProviderCreatedEmailToOwner(
                 pending.name,
-                pending.providerType
+                pending.providerType,
               );
             }
 
@@ -2011,10 +2175,11 @@ export function ProviderSection({ id }: { id?: string }) {
                     setVisitFrequency("");
                   }
                 }}
-                className={`w-full p-3 bg-[var(--input-bg)] border rounded ${providerTypeError
-                  ? "border-red-500"
-                  : "border-[var(--input-border)]"
-                  }`}
+                className={`w-full p-3 bg-[var(--input-bg)] border rounded ${
+                  providerTypeError
+                    ? "border-red-500"
+                    : "border-[var(--input-border)]"
+                }`}
                 disabled={!company || saving}
               >
                 <option value="">Seleccione un tipo</option>
@@ -2148,10 +2313,11 @@ export function ProviderSection({ id }: { id?: string }) {
                                   toggleVisitDay(day, setVisitCreateDays)
                                 }
                                 title={VISIT_DAY_TITLES[day]}
-                                className={`px-2 py-1 rounded border text-xs transition-colors ${selected
-                                  ? "bg-[var(--accent)] text-white border-[var(--accent)]"
-                                  : "bg-[var(--input-bg)] text-[var(--foreground)] border-[var(--input-border)]"
-                                  }`}
+                                className={`px-2 py-1 rounded border text-xs transition-colors ${
+                                  selected
+                                    ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                                    : "bg-[var(--input-bg)] text-[var(--foreground)] border-[var(--input-border)]"
+                                }`}
                               >
                                 {day}
                               </button>
@@ -2175,10 +2341,11 @@ export function ProviderSection({ id }: { id?: string }) {
                                   toggleVisitDay(day, setVisitReceiveDays)
                                 }
                                 title={VISIT_DAY_TITLES[day]}
-                                className={`px-2 py-1 rounded border text-xs transition-colors ${selected
-                                  ? "bg-[var(--accent)] text-white border-[var(--accent)]"
-                                  : "bg-[var(--input-bg)] text-[var(--foreground)] border-[var(--input-border)]"
-                                  }`}
+                                className={`px-2 py-1 rounded border text-xs transition-colors ${
+                                  selected
+                                    ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                                    : "bg-[var(--input-bg)] text-[var(--foreground)] border-[var(--input-border)]"
+                                }`}
                               >
                                 {day}
                               </button>
@@ -2194,7 +2361,9 @@ export function ProviderSection({ id }: { id?: string }) {
                         <select
                           value={visitFrequency}
                           onChange={(e) =>
-                            setVisitFrequency(e.target.value as ProviderVisitFrequency | "")
+                            setVisitFrequency(
+                              e.target.value as ProviderVisitFrequency | "",
+                            )
                           }
                           className="w-full p-3 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm"
                           disabled={!company || saving}
@@ -2216,12 +2385,15 @@ export function ProviderSection({ id }: { id?: string }) {
                           <input
                             type="date"
                             value={visitStartDateISO}
-                            onChange={(e) => setVisitStartDateISO(e.target.value)}
+                            onChange={(e) =>
+                              setVisitStartDateISO(e.target.value)
+                            }
                             className="w-full p-3 bg-[var(--input-bg)] border border-[var(--input-border)] rounded text-sm"
                             disabled={!company || saving}
                           />
                           <div className="mt-1 text-[10px] text-[var(--muted-foreground)]">
-                            Define desde qué semana empieza el ciclo (quincenal/22 días/mensual).
+                            Define desde qué semana empieza el ciclo
+                            (quincenal/22 días/mensual).
                           </div>
                         </div>
                       ) : null}
@@ -2279,7 +2451,7 @@ export function ProviderSection({ id }: { id?: string }) {
                   // Validar que si se marcó notificación, se haya seleccionado un admin
                   if (addNotification && !selectedAdminId) {
                     setFormError(
-                      "Debe seleccionar un administrador para las notificaciones."
+                      "Debe seleccionar un administrador para las notificaciones.",
                     );
                     return;
                   }
@@ -2288,7 +2460,7 @@ export function ProviderSection({ id }: { id?: string }) {
                   let correonotifi: string | undefined = undefined;
                   if (addNotification && selectedAdminId) {
                     const selectedAdmin = adminUsers.find(
-                      (admin) => admin.id === selectedAdminId
+                      (admin) => admin.id === selectedAdminId,
                     );
                     if (selectedAdmin?.email) {
                       correonotifi = selectedAdmin.email;
@@ -2298,15 +2470,21 @@ export function ProviderSection({ id }: { id?: string }) {
                   let visit: ProviderVisitConfig | undefined = undefined;
                   if (isCompraInventarioProvider && addVisit) {
                     if (visitCreateDays.length === 0) {
-                      setFormError("Debe seleccionar al menos un día para crear pedido.");
+                      setFormError(
+                        "Debe seleccionar al menos un día para crear pedido.",
+                      );
                       return;
                     }
                     if (visitReceiveDays.length === 0) {
-                      setFormError("Debe seleccionar al menos un día para recibir pedido.");
+                      setFormError(
+                        "Debe seleccionar al menos un día para recibir pedido.",
+                      );
                       return;
                     }
                     if (!visitFrequency) {
-                      setFormError("Debe seleccionar una frecuencia de visita.");
+                      setFormError(
+                        "Debe seleccionar una frecuencia de visita.",
+                      );
                       return;
                     }
 
@@ -2314,7 +2492,9 @@ export function ProviderSection({ id }: { id?: string }) {
                     if (visitFrequency !== "SEMANAL") {
                       const key = isoDateToDateKey(visitStartDateISO);
                       if (!key) {
-                        setFormError("Debe seleccionar una fecha inicial válida.");
+                        setFormError(
+                          "Debe seleccionar una fecha inicial válida.",
+                        );
                         return;
                       }
                       startDateKey = key;
@@ -2324,7 +2504,9 @@ export function ProviderSection({ id }: { id?: string }) {
                       createOrderDays: visitCreateDays,
                       receiveOrderDays: visitReceiveDays,
                       frequency: visitFrequency as ProviderVisitFrequency,
-                      ...(typeof startDateKey === "number" ? { startDateKey } : {}),
+                      ...(typeof startDateKey === "number"
+                        ? { startDateKey }
+                        : {}),
                     };
                   }
 
@@ -2336,11 +2518,11 @@ export function ProviderSection({ id }: { id?: string }) {
 
                     if (editingProviderCode) {
                       const otherProviders = providers.filter(
-                        (p) => p.code !== editingProviderCode
+                        (p) => p.code !== editingProviderCode,
                       );
                       if (
                         otherProviders.some(
-                          (p) => p.name.toUpperCase() === name
+                          (p) => p.name.toUpperCase() === name,
                         )
                       ) {
                         setFormError(`El proveedor "${name}" ya existe.`);
@@ -2349,11 +2531,11 @@ export function ProviderSection({ id }: { id?: string }) {
 
                       const { best, score } = findBestStringMatch(
                         name,
-                        otherProviders.map((p) => p.name)
+                        otherProviders.map((p) => p.name),
                       );
                       if (best && score >= 0.9) {
                         const similarProvider = otherProviders.find(
-                          (p) => p.name === best
+                          (p) => p.name === best,
                         );
                         const similarTypeLabel = similarProvider?.type
                           ? formatMovementType(similarProvider.type)
@@ -2419,7 +2601,7 @@ export function ProviderSection({ id }: { id?: string }) {
                             <p className="mt-4 text-center">
                               ¿Deseas continuar y guardarlo de todas formas?
                             </p>
-                          </div>
+                          </div>,
                         );
                         setSimilarConfirmOpen(true);
                         return;
@@ -2431,7 +2613,7 @@ export function ProviderSection({ id }: { id?: string }) {
                         name,
                         normalizedProviderType,
                         correonotifi,
-                        visit
+                        visit,
                       );
                     } else {
                       if (
@@ -2443,11 +2625,11 @@ export function ProviderSection({ id }: { id?: string }) {
 
                       const { best, score } = findBestStringMatch(
                         name,
-                        providers.map((p) => p.name)
+                        providers.map((p) => p.name),
                       );
                       if (best && score >= 0.9) {
                         const similarProvider = providers.find(
-                          (p) => p.name === best
+                          (p) => p.name === best,
                         );
                         const similarTypeLabel = similarProvider?.type
                           ? formatMovementType(similarProvider.type)
@@ -2512,7 +2694,7 @@ export function ProviderSection({ id }: { id?: string }) {
                             <p className="mt-4 text-center">
                               ¿Deseas continuar y guardarlo de todas formas?
                             </p>
-                          </div>
+                          </div>,
                         );
                         setSimilarConfirmOpen(true);
                         return;
@@ -2523,12 +2705,12 @@ export function ProviderSection({ id }: { id?: string }) {
                         name,
                         normalizedProviderType,
                         correonotifi,
-                        visit
+                        visit,
                       );
 
                       await sendEgresoProviderCreatedEmailToOwner(
                         name,
-                        normalizedProviderType
+                        normalizedProviderType,
                       );
                     }
                     setProviderName("");
@@ -2603,6 +2785,10 @@ export function FondoSection({
     }
     return set;
   }, [actorOwnerIds, user?.ownerId]);
+  const allowedOwnerIdsKey = useMemo(
+    () => Array.from(allowedOwnerIds).sort().join("|"),
+    [allowedOwnerIds],
+  );
   const resolvedOwnerId = useMemo(() => {
     const normalizedPrimary = (primaryOwnerId || "").trim();
     if (normalizedPrimary) return normalizedPrimary;
@@ -2612,6 +2798,7 @@ export function FondoSection({
   }, [allowedOwnerIds, primaryOwnerId]);
   const isAdminUser = user?.role === "admin";
   const isSuperAdminUser = user?.role === "superadmin";
+  const isRegularUser = user?.role === "user";
   const [superAdminTotalsOpen, setSuperAdminTotalsOpen] = useState(false);
   const canSelectCompany = isAdminUser || isSuperAdminUser;
   const [adminCompany, setAdminCompany] = useState(() => {
@@ -2634,14 +2821,58 @@ export function FondoSection({
   const [ownerCompanies, setOwnerCompanies] = useState<Empresas[]>([]);
   const [ownerCompaniesLoading, setOwnerCompaniesLoading] = useState(false);
   const [ownerCompaniesError, setOwnerCompaniesError] = useState<string | null>(
-    null
+    null,
   );
 
   const sortedOwnerCompanies = useMemo(() => {
-    return ownerCompanies.slice().sort((a, b) =>
-      (a.name || "").localeCompare(b.name || "", "es", {
-        sensitivity: "base",
-      })
+    const normalize = (value: unknown) =>
+      String(value || "")
+        .trim()
+        .toLowerCase();
+
+    const valueKey = (emp: Empresas) =>
+      normalize(emp?.name || emp?.ubicacion || emp?.id || "");
+
+    const score = (emp: Empresas) =>
+      (normalize(emp?.id) ? 2 : 0) +
+      (normalize(emp?.name) ? 1 : 0) +
+      (normalize(emp?.ubicacion) ? 1 : 0);
+
+    const byKey = new Map<string, Empresas>();
+    ownerCompanies.forEach((emp) => {
+      const key = valueKey(emp);
+      if (!key) return;
+      const existing = byKey.get(key);
+      if (!existing || score(emp) > score(existing)) {
+        byKey.set(key, emp);
+      }
+    });
+
+    const deduped = Array.from(byKey.values());
+
+    const ubicacionesWithNamed = new Set<string>();
+    deduped.forEach((emp) => {
+      const name = normalize(emp?.name);
+      const ubicacion = normalize(emp?.ubicacion);
+      if (name && ubicacion) ubicacionesWithNamed.add(ubicacion);
+    });
+
+    const cleaned = deduped.filter((emp) => {
+      const name = normalize(emp?.name);
+      const ubicacion = normalize(emp?.ubicacion);
+      if (!name && ubicacion && ubicacionesWithNamed.has(ubicacion))
+        return false;
+      return true;
+    });
+
+    return cleaned.sort((a, b) =>
+      (a.name || a.ubicacion || "").localeCompare(
+        b.name || b.ubicacion || "",
+        "es",
+        {
+          sensitivity: "base",
+        },
+      ),
     );
   }, [ownerCompanies]);
 
@@ -2664,7 +2895,7 @@ export function FondoSection({
       setOwnerCompanies([]);
       setOwnerCompaniesLoading(false);
       setOwnerCompaniesError(
-        "No se pudo determinar el ownerId asociado a tu cuenta."
+        "No se pudo determinar el ownerId asociado a tu cuenta.",
       );
       return;
     }
@@ -2678,10 +2909,10 @@ export function FondoSection({
         if (!isMounted) return;
         const filtered = isAdminUser
           ? empresas.filter((emp) => {
-            const owner = (emp.ownerId || "").trim();
-            if (!owner) return false;
-            return allowedOwnerIds.has(owner);
-          })
+              const owner = (emp.ownerId || "").trim();
+              if (!owner) return false;
+              return allowedOwnerIds.has(owner);
+            })
           : empresas;
         setOwnerCompanies(filtered);
         setAdminCompany((current) => {
@@ -2706,7 +2937,7 @@ export function FondoSection({
         setOwnerCompaniesError(
           err instanceof Error
             ? err.message
-            : "No se pudieron cargar las empresas disponibles."
+            : "No se pudieron cargar las empresas disponibles.",
         );
       })
       .finally(() => {
@@ -2716,7 +2947,7 @@ export function FondoSection({
     return () => {
       isMounted = false;
     };
-  }, [allowedOwnerIds, canSelectCompany, isAdminUser]);
+  }, [allowedOwnerIdsKey, canSelectCompany, isAdminUser]);
 
   const activeOwnerId = useMemo(() => {
     const normalizeCompanyKey = (value: unknown) =>
@@ -2770,7 +3001,7 @@ export function FondoSection({
         if (cancelled) return;
         console.error(
           "Error loading owner admin email for daily closing notifications:",
-          error
+          error,
         );
         setOwnerAdminEmail(null);
       }
@@ -2796,7 +3027,7 @@ export function FondoSection({
     NAMESPACE_DESCRIPTIONS[namespace] || "esta sección del Fondo General";
   const accountKey = useMemo(
     () => getAccountKeyFromNamespace(namespace),
-    [namespace]
+    [namespace],
   );
 
   // Estado para tipos de movimientos dinámicos
@@ -2808,6 +3039,8 @@ export function FondoSection({
   const [fondoEntries, setFondoEntries] = useState<FondoEntry[]>([]);
   const [companyEmployees, setCompanyEmployees] = useState<string[]>([]);
   const [employeesLoading, setEmployeesLoading] = useState(false);
+  const [superAdminUsers, setSuperAdminUsers] = useState<User[]>([]);
+  const [superAdminUsersLoading, setSuperAdminUsersLoading] = useState(false);
 
   const [selectedProvider, setSelectedProvider] = useState("");
   const [invoiceNumber, setInvoiceNumber] = useState("");
@@ -2842,7 +3075,7 @@ export function FondoSection({
   const [movementModalOpen, setMovementModalOpen] = useState(false);
   const [movementAutoCloseLocked, setMovementAutoCloseLocked] = useState(false);
   const [movementCurrency, setMovementCurrency] = useState<"CRC" | "USD">(
-    "CRC"
+    "CRC",
   );
   const [providerError, setProviderError] = useState("");
   const [invoiceError, setInvoiceError] = useState("");
@@ -2858,16 +3091,232 @@ export function FondoSection({
   const [dailyClosingsHydrated, setDailyClosingsHydrated] = useState(false);
   const [dailyClosingsRefreshing, setDailyClosingsRefreshing] = useState(false);
   const [dailyClosingHistoryOpen, setDailyClosingHistoryOpen] = useState(false);
+  const [dailyClosingHistoryRange, setDailyClosingHistoryRange] =
+    useState<string>("today");
   const [expandedClosings, setExpandedClosings] = useState<Set<string>>(
-    new Set()
+    new Set(),
   );
   const [pendingCierreDeCaja, setPendingCierreDeCaja] = useState(false);
+  const [negativeBalanceModal, setNegativeBalanceModal] = useState<{
+    open: boolean;
+    amount: number;
+    currency: "CRC" | "USD";
+    resultingNegativeAmount: number;
+  }>({ open: false, amount: 0, currency: "CRC", resultingNegativeAmount: 0 });
+
   const dailyClosingsRequestCountRef = useRef(0);
+  const dailyClosingHistoryRequestIdRef = useRef(0);
   const isComponentMountedRef = useRef(true);
   const loadedDailyClosingKeysRef = useRef<Set<string>>(new Set());
   const loadingDailyClosingKeysRef = useRef<Set<string>>(new Set());
   const lastEditSaveTimestampRef = useRef<number>(0);
   const editingInProgressRef = useRef<boolean>(false);
+  const dailyClosingSubmitInProgressRef = useRef<boolean>(false);
+  const lastDailyClosingSavedAtRef = useRef<number>(0);
+  const movementSubmitInProgressRef = useRef<boolean>(false);
+  const lastMovementDedupeRef = useRef<{
+    at: number;
+    fingerprint: string;
+  } | null>(null);
+  const lastMovementCreatedAtRef = useRef<number>(0);
+  const deleteLatestClosingInProgressRef = useRef<boolean>(false);
+
+  const DAILY_CLOSING_MIN_INTERVAL_MS = 60_000;
+  const MOVEMENT_DUPLICATE_WINDOW_MS = 60_000;
+  const MOVEMENT_MIN_INTERVAL_MS = 60_000;
+  const CLOSING_GUARD_LOCK_MS = 30 * 60_000;
+
+  const buildClosingGuardDocId = useCallback(
+    (normalizedCompany: string, kind: ClosingGuardKind) => {
+      // Ensure a Firestore-safe doc id (avoid '/').
+      // Include kind so Fondo Ventas and Fondo General are distinct locks.
+      const companyPart = encodeURIComponent(
+        normalizedCompany.trim().toLowerCase(),
+      );
+      return `${companyPart}__${kind}`;
+    },
+    [],
+  );
+
+  const acquireClosingGuard = useCallback(
+    async (
+      normalizedCompany: string,
+      kind: ClosingGuardKind,
+    ): Promise<
+      | { ok: true; token: string; docId: string }
+      | {
+          ok: false;
+          remainingSec: number;
+          lockedKind?: ClosingGuardKind;
+          lockedBy?: string;
+        }
+    > => {
+      const docId = buildClosingGuardDocId(normalizedCompany, kind);
+      const lockRef = doc(db, "closingGuards", docId);
+      const token = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+      try {
+        const result = await runTransaction(db, async (tx) => {
+          const snap = await tx.get(lockRef);
+          const nowMs = Date.now();
+          const current = snap.exists() ? (snap.data() as any) : null;
+          const lockedUntilMs = Number(current?.lockedUntilMs || 0);
+          const lockedKind =
+            (current?.kind as ClosingGuardKind | undefined) ?? undefined;
+          const lockedBy =
+            typeof current?.by === "string" ? current.by : undefined;
+          const lockedToken =
+            typeof current?.token === "string" ? current.token : undefined;
+
+          if (lockedUntilMs > nowMs && lockedToken && lockedToken.length > 0) {
+            const remainingSec = Math.max(
+              1,
+              Math.ceil((lockedUntilMs - nowMs) / 1000),
+            );
+            return { ok: false as const, remainingSec, lockedKind, lockedBy };
+          }
+
+          tx.set(
+            lockRef,
+            {
+              token,
+              kind,
+              lockedUntilMs: nowMs + CLOSING_GUARD_LOCK_MS,
+              by: (user?.email || user?.id || "").toString(),
+              startedAt: serverTimestamp(),
+            },
+            { merge: true },
+          );
+          return { ok: true as const };
+        });
+
+        if (!result.ok) return result;
+        return { ok: true, token, docId };
+      } catch (err) {
+        console.error("[CLOSING-GUARD] Error acquiring closing guard:", err);
+        // Fail-open to avoid blocking all closings if Firestore is unreachable.
+        // Client-side cooldowns still reduce duplicates in this scenario.
+        return { ok: true, token, docId };
+      }
+    },
+    [buildClosingGuardDocId, CLOSING_GUARD_LOCK_MS, user],
+  );
+
+  // Touch/update the guard without enforcing it.
+  // Used so that when an admin/superadmin creates a closing, regular users are still blocked
+  // for the lock window, but admins are never prevented from creating a new closing.
+  const touchClosingGuard = useCallback(
+    async (
+      normalizedCompany: string,
+      kind: ClosingGuardKind,
+    ): Promise<void> => {
+      const docId = buildClosingGuardDocId(normalizedCompany, kind);
+      const lockRef = doc(db, "closingGuards", docId);
+      const token = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+      try {
+        await runTransaction(db, async (tx) => {
+          const nowMs = Date.now();
+          tx.set(
+            lockRef,
+            {
+              token,
+              kind,
+              lockedUntilMs: nowMs + CLOSING_GUARD_LOCK_MS,
+              by: (user?.email || user?.id || "").toString(),
+              startedAt: serverTimestamp(),
+            },
+            { merge: true },
+          );
+        });
+      } catch (err) {
+        console.error("[CLOSING-GUARD] Error touching closing guard:", err);
+      }
+    },
+    [buildClosingGuardDocId, CLOSING_GUARD_LOCK_MS, user],
+  );
+
+  const releaseClosingGuard = useCallback(
+    async (
+      normalizedCompany: string,
+      guard: { token: string; docId: string },
+    ) => {
+      const lockRef = doc(db, "closingGuards", guard.docId);
+      try {
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(lockRef);
+          if (!snap.exists()) return;
+          const current = snap.data() as any;
+          if (current?.token !== guard.token) return;
+          tx.set(
+            lockRef,
+            {
+              token: "",
+              lockedUntilMs: 0,
+              releasedAt: serverTimestamp(),
+            },
+            { merge: true },
+          );
+        });
+      } catch (err) {
+        console.error("[CLOSING-GUARD] Error releasing closing guard:", err);
+      }
+    },
+    [],
+  );
+
+  // Force-clear any existing lock (ignores current token) so remaining time becomes 0 immediately.
+  // Used after deleting closings so users can re-create them right away.
+  const forceClearClosingGuards = useCallback(
+    async (normalizedCompany: string, context: string) => {
+      try {
+        const fgDocId = buildClosingGuardDocId(
+          normalizedCompany,
+          "FONDO_GENERAL",
+        );
+        const fvDocId = buildClosingGuardDocId(
+          normalizedCompany,
+          "FONDO_VENTAS",
+        );
+        const fgRef = doc(db, "closingGuards", fgDocId);
+        const fvRef = doc(db, "closingGuards", fvDocId);
+        const by = (user?.email || user?.id || "").toString();
+
+        await runTransaction(db, async (tx) => {
+          tx.set(
+            fgRef,
+            {
+              kind: "FONDO_GENERAL",
+              token: "",
+              lockedUntilMs: 0,
+              clearedAt: serverTimestamp(),
+              clearedBy: by,
+              clearedContext: context,
+            },
+            { merge: true },
+          );
+          tx.set(
+            fvRef,
+            {
+              kind: "FONDO_VENTAS",
+              token: "",
+              lockedUntilMs: 0,
+              clearedAt: serverTimestamp(),
+              clearedBy: by,
+              clearedContext: context,
+            },
+            { merge: true },
+          );
+        });
+      } catch (err) {
+        console.error(
+          "[CLOSING-GUARD] Error force-clearing closing guards:",
+          err,
+        );
+      }
+    },
+    [buildClosingGuardDocId, user],
+  );
 
   const [pageSize, setPageSize] = useState<"daily" | number | "all">(() => {
     if (typeof window !== "undefined") {
@@ -2888,7 +3337,7 @@ export function FondoSection({
   });
   const [pageIndex, setPageIndex] = useState(0);
   const [currentDailyKey, setCurrentDailyKey] = useState(() =>
-    dateKeyFromDate(new Date())
+    dateKeyFromDate(new Date()),
   );
   const todayKey = useMemo(() => dateKeyFromDate(new Date()), []);
 
@@ -2900,7 +3349,7 @@ export function FondoSection({
   const finishDailyClosingsRequest = useCallback(() => {
     dailyClosingsRequestCountRef.current = Math.max(
       0,
-      dailyClosingsRequestCountRef.current - 1
+      dailyClosingsRequestCountRef.current - 1,
     );
     if (!isComponentMountedRef.current) return;
     if (dailyClosingsRequestCountRef.current === 0) {
@@ -2927,7 +3376,7 @@ export function FondoSection({
   const endMovementsLoading = useCallback(() => {
     movementsLoadingCountRef.current = Math.max(
       0,
-      movementsLoadingCountRef.current - 1
+      movementsLoadingCountRef.current - 1,
     );
     if (!isComponentMountedRef.current) return;
     if (movementsLoadingCountRef.current === 0) {
@@ -2950,15 +3399,151 @@ export function FondoSection({
   });
   const [confirmOpenCreateMovement, setConfirmOpenCreateMovement] =
     useState(false);
+
+  // Modal: primer movimiento después del último cierre de Fondo General
+  const [confirmPhysicalCountOpen, setConfirmPhysicalCountOpen] =
+    useState(false);
+  const [physicalCountWasDone, setPhysicalCountWasDone] = useState(false);
   // Estado para indicar que se está guardando un movimiento y prevenir múltiples envíos
   const [isSaving, setIsSaving] = useState(false);
   const enabledBalanceCurrencies = useMemo(
     () =>
       (["CRC", "USD"] as MovementCurrencyKey[]).filter(
-        (currency) => currencyEnabled[currency]
+        (currency) => currencyEnabled[currency],
       ),
-    [currencyEnabled]
+    [currencyEnabled],
   );
+
+  // Marca en localStorage para confirmar conteo físico antes del primer movimiento
+  // después del cierre de hoy. IMPORTANTE: debe leerse en tiempo real (no memoizada)
+  // porque localStorage puede cambiar sin alterar dependencias de React.
+  // Legacy keys (previous formats)
+  const buildLegacyPhysicalCountStorageKey = useCallback(() => {
+    if (accountKey !== "FondoGeneral") return null;
+    const normalizedCompany = (company || "").trim();
+    if (normalizedCompany.length === 0) return null;
+    // Legacy format (no date, with accountKey)
+    return `fondogeneral-lastClosing:${normalizedCompany}:${accountKey}`;
+  }, [company, accountKey]);
+
+  // New key: one per company (feature only applies to FondoGeneral)
+  const buildPhysicalCountStorageKey = useCallback(() => {
+    if (accountKey !== "FondoGeneral") return null;
+    const normalizedCompany = (company || "").trim();
+    if (normalizedCompany.length === 0) return null;
+    return `fondogeneral-lastClosing:${normalizedCompany}`;
+  }, [company, accountKey]);
+
+  const cleanupPhysicalCountLegacyKeys = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (accountKey !== "FondoGeneral") return;
+    const normalizedCompany = (company || "").trim();
+    if (normalizedCompany.length === 0) return;
+
+    // Remove per-day keys: fondogeneral-lastClosing:<company>:FondoGeneral:<YYYY-MM-DD>
+    const dateScopedPrefix = `fondogeneral-lastClosing:${normalizedCompany}:FondoGeneral:`;
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(dateScopedPrefix)) {
+          localStorage.removeItem(k);
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    // Also remove legacy key (no date, with accountKey)
+    try {
+      const legacyKey = buildLegacyPhysicalCountStorageKey();
+      if (legacyKey) localStorage.removeItem(legacyKey);
+    } catch {
+      // ignore
+    }
+  }, [accountKey, company, buildLegacyPhysicalCountStorageKey]);
+
+  const shouldPromptPhysicalCount = useCallback((): boolean => {
+    if (accountKey !== "FondoGeneral") return false;
+    if (typeof window === "undefined") return false;
+
+    const newKey = buildPhysicalCountStorageKey();
+    if (!newKey) return false;
+
+    const normalizeBoolean = (raw: string | null): boolean | null => {
+      if (raw === "true") return true;
+      if (raw === "false") return false;
+      if (raw === null) return null;
+      return null;
+    };
+
+    const tryMigrateLegacyValue = (raw: string | null): boolean => {
+      const asBool = normalizeBoolean(raw);
+      if (asBool === true) return true;
+      if (asBool === false || raw === null) return false;
+
+      // Compatibilidad con el formato anterior: JSON { dateKey, id, at }
+      try {
+        const parsed = JSON.parse(raw) as any;
+        // Si hay un JSON, asumir que hubo cierre => pedir confirmación.
+        // En el esquema anterior esto era por día; ahora lo volvemos global.
+        return Boolean(parsed);
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      // New format: value "true"/"false" (global per company)
+      const rawNew = localStorage.getItem(newKey);
+      const boolNew = normalizeBoolean(rawNew);
+      if (boolNew !== null) return boolNew;
+
+      // If for some reason JSON was stored in the new key, treat it as pending.
+      if (tryMigrateLegacyValue(rawNew)) {
+        localStorage.setItem(newKey, "true");
+        return true;
+      }
+
+      // Migrate legacy key (no date, with accountKey)
+      const legacyKey = buildLegacyPhysicalCountStorageKey();
+      const rawLegacy = legacyKey ? localStorage.getItem(legacyKey) : null;
+      const legacyPending = tryMigrateLegacyValue(rawLegacy);
+
+      // Migrate date-scoped keys (older format): if any is true, make it global.
+      const normalizedCompany = (company || "").trim();
+      const dateScopedPrefix = `fondogeneral-lastClosing:${normalizedCompany}:FondoGeneral:`;
+      let dateScopedPending = false;
+      if (normalizedCompany.length > 0) {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (!k || !k.startsWith(dateScopedPrefix)) continue;
+          const v = localStorage.getItem(k);
+          if (normalizeBoolean(v) === true || tryMigrateLegacyValue(v)) {
+            dateScopedPending = true;
+            break;
+          }
+        }
+      }
+
+      const pending = legacyPending || dateScopedPending;
+      if (pending) {
+        localStorage.setItem(newKey, "true");
+      }
+
+      // Cleanup old keys to enforce the new single-key scheme
+      cleanupPhysicalCountLegacyKeys();
+
+      return pending;
+    } catch {
+      return false;
+    }
+  }, [
+    accountKey,
+    buildPhysicalCountStorageKey,
+    buildLegacyPhysicalCountStorageKey,
+    cleanupPhysicalCountLegacyKeys,
+    company,
+  ]);
   const closingsStorageKey = useMemo(() => {
     if (accountKey !== "FondoGeneral") return null;
     const normalizedCompany = (company || "").trim();
@@ -3015,7 +3600,7 @@ export function FondoSection({
       const resolveSettings = (currency: MovementCurrencyKey) => {
         const accountBalance = state.balancesByAccount?.find(
           (balance) =>
-            balance.accountId === accountKey && balance.currency === currency
+            balance.accountId === accountKey && balance.currency === currency,
         );
         return {
           enabled: accountBalance?.enabled ?? true,
@@ -3042,7 +3627,7 @@ export function FondoSection({
         currentUSD: usdSettings.currentBalance,
       });
     },
-    [accountKey]
+    [accountKey],
   );
 
   // Cache v2 movements per companyKey to avoid re-reading the whole subcollection when switching tabs.
@@ -3078,11 +3663,14 @@ export function FondoSection({
         0,
         0,
         0,
-        0
+        0,
       );
       const end = new Date(start);
       end.setDate(end.getDate() + 1);
-      return { startIso: start.toISOString(), endIsoExclusive: end.toISOString() };
+      return {
+        startIso: start.toISOString(),
+        endIsoExclusive: end.toISOString(),
+      };
     }
 
     const start = new Date(y, m - 1, d, 0, 0, 0, 0);
@@ -3160,10 +3748,10 @@ export function FondoSection({
       const entries = sanitizeFondoEntries(
         scopedEntries,
         undefined,
-        targetAccountKey
+        targetAccountKey,
       ).sort(
         (a, b) =>
-          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
       );
       setFondoEntries(entries);
 
@@ -3172,11 +3760,11 @@ export function FondoSection({
         applyLedgerStateFromStorage(state);
       }
     },
-    [applyLedgerStateFromStorage]
+    [applyLedgerStateFromStorage],
   );
 
   const ensureV2MovementsLoaded = useCallback(
-    async (docKey: string) => {
+    async (docKey: string, options?: { append?: boolean }) => {
       if (!docKey) return;
 
       const targetAccountKey = accountKeyRef.current;
@@ -3196,15 +3784,32 @@ export function FondoSection({
 
       if (cached.loading) return;
 
-      if (
+      const queryUnchanged =
         cached.loaded &&
         cached.queryKey === queryKey &&
         cached.startIso === startIso &&
-        cached.endIsoExclusive === endIsoExclusive
-      ) {
+        cached.endIsoExclusive === endIsoExclusive;
+
+      const append = Boolean(options?.append);
+      // If query params changed, we must reset regardless of append intent.
+      if (queryUnchanged && !append) {
         rebuildEntriesFromV2Cache(docKey, targetAccountKey);
         return;
       }
+
+      const computeRemoteBatchSize = () => {
+        // Hard cap for daily mode per requirement.
+        if (pageSize === "daily") return 100;
+        // Never do unbounded reads; treat "all" as a capped batch.
+        if (pageSize === "all") return 100;
+        if (typeof pageSize === "number") {
+          // Fetch a bit more than one UI page to reduce roundtrips, but keep it bounded.
+          return Math.max(1, Math.min(100, Math.trunc(pageSize) * 3));
+        }
+        return 100;
+      };
+
+      const remoteBatchSize = computeRemoteBatchSize();
 
       console.log("[FG-QUERY] MovimientosFondos v2 query", {
         docKey,
@@ -3215,7 +3820,8 @@ export function FondoSection({
           lt: endIsoExclusive,
         },
         orderBy: "createdAt desc",
-        pageSize: 500,
+        pageSize: remoteBatchSize,
+        append,
         ui: {
           pageSizeMode: pageSize,
           currentDailyKey,
@@ -3225,12 +3831,15 @@ export function FondoSection({
         },
       });
 
+      const shouldReset = !queryUnchanged || !append;
       const nextCache = {
         ...cached,
         loaded: false,
-        movements: [] as FondoEntry[],
-        cursor: null as QueryDocumentSnapshot<DocumentData> | null,
-        exhausted: false,
+        movements: shouldReset ? ([] as FondoEntry[]) : cached.movements,
+        cursor: shouldReset
+          ? (null as QueryDocumentSnapshot<DocumentData> | null)
+          : cached.cursor,
+        exhausted: shouldReset ? false : cached.exhausted,
         loading: true,
         queryKey,
         startIso,
@@ -3241,49 +3850,27 @@ export function FondoSection({
       beginMovementsLoading();
 
       try {
-        let cursor: QueryDocumentSnapshot<DocumentData> | null = null;
-        let exhausted = false;
-        const movements: FondoEntry[] = [];
+        const pageResult =
+          await MovimientosFondosService.listMovementsPageByCreatedAtRange(
+            docKey,
+            {
+              startIso,
+              endIsoExclusive,
+              pageSize: remoteBatchSize,
+              cursor: shouldReset ? null : nextCache.cursor,
+            },
+          );
 
-        type MovementsPageResult = {
-          items: Array<FondoEntry & { id: string }>;
-          cursor: QueryDocumentSnapshot<DocumentData> | null;
-          exhausted: boolean;
-        };
-
-        // Safety cap: avoid unbounded reads.
-        let pages = 0;
-        const maxPages = 50; // 50 * 500 = 25k
-
-        while (!exhausted && pages < maxPages) {
-          const pageResult: MovementsPageResult =
-            await MovimientosFondosService.listMovementsPageByCreatedAtRange(
-              docKey,
-              {
-                startIso,
-                endIsoExclusive,
-                pageSize: 500,
-                cursor,
-              }
-            );
-
-          if (!pageResult.items || pageResult.items.length === 0) {
-            exhausted = true;
-            break;
-          }
-
-          movements.push(...(pageResult.items as FondoEntry[]));
-          cursor = pageResult.cursor;
-          exhausted = pageResult.exhausted;
-          pages += 1;
-        }
+        const mergedMovements = shouldReset
+          ? (pageResult.items as FondoEntry[])
+          : [...nextCache.movements, ...(pageResult.items as FondoEntry[])];
 
         v2MovementsCacheRef.current[docKey] = {
           ...nextCache,
           loaded: true,
-          movements,
-          cursor,
-          exhausted,
+          movements: mergedMovements,
+          cursor: pageResult.cursor,
+          exhausted: pageResult.exhausted,
           loading: false,
         };
       } finally {
@@ -3309,8 +3896,34 @@ export function FondoSection({
       todayKey,
       fromFilter,
       toFilter,
-    ]
+    ],
   );
+
+  // When using numeric pagination, load more remote pages only if needed.
+  useEffect(() => {
+    if (!entriesHydrated) return;
+    if (pageSize === "daily" || pageSize === "all") return;
+    if (typeof pageSize !== "number") return;
+    if (pageSize <= 0) return;
+
+    const docKey = resolveV2DocKey();
+    if (!docKey) return;
+    const cached = v2MovementsCacheRef.current[docKey];
+    if (!cached?.loaded) return;
+    if (cached.loading || cached.exhausted) return;
+
+    const needed = (pageIndex + 1) * pageSize;
+    if (cached.movements.length >= needed) return;
+
+    // Append one more batch when user navigates past what we have.
+    void ensureV2MovementsLoaded(docKey, { append: true });
+  }, [
+    entriesHydrated,
+    pageSize,
+    pageIndex,
+    resolveV2DocKey,
+    ensureV2MovementsLoaded,
+  ]);
 
   useEffect(() => {
     localStorage.setItem("fondogeneral-sortAsc", JSON.stringify(sortAsc));
@@ -3340,7 +3953,7 @@ export function FondoSection({
         return saved !== null ? saved : "all";
       }
       return "all";
-    }
+    },
   );
   const [providerFilter, setProviderFilter] = useState("");
   const [isProviderDropdownOpen, setIsProviderDropdownOpen] = useState(false);
@@ -3388,12 +4001,12 @@ export function FondoSection({
     () => {
       if (typeof window !== "undefined") {
         const saved = localStorage.getItem(
-          "fondogeneral-keepFiltersAcrossCompanies"
+          "fondogeneral-keepFiltersAcrossCompanies",
         );
         return saved !== null ? JSON.parse(saved) : false;
       }
       return false;
-    }
+    },
   );
 
   // Column widths for resizable columns (simple px based)
@@ -3486,14 +4099,14 @@ export function FondoSection({
     // Escuchar actualizaciones en tiempo real
     window.addEventListener(
       "fondoMovementTypesUpdated",
-      handleFondoTypesUpdate
+      handleFondoTypesUpdate,
     );
 
     return () => {
       isMounted = false;
       window.removeEventListener(
         "fondoMovementTypesUpdated",
-        handleFondoTypesUpdate
+        handleFondoTypesUpdate,
       );
     };
   }, []);
@@ -3505,7 +4118,7 @@ export function FondoSection({
     } else {
       const option = providers.find((p) => p.code === filterProviderCode);
       setProviderFilter(
-        option ? `${option.name} (${option.code})` : filterProviderCode
+        option ? `${option.name} (${option.code})` : filterProviderCode,
       );
     }
   }, [filterProviderCode, providers]);
@@ -3523,7 +4136,7 @@ export function FondoSection({
   useEffect(() => {
     localStorage.setItem(
       "fondogeneral-rememberFilters",
-      JSON.stringify(rememberFilters)
+      JSON.stringify(rememberFilters),
     );
     if (!rememberFilters && typeof window !== "undefined") {
       try {
@@ -3547,7 +4160,7 @@ export function FondoSection({
   useEffect(() => {
     localStorage.setItem(
       "fondogeneral-keepFiltersAcrossCompanies",
-      JSON.stringify(keepFiltersAcrossCompanies)
+      JSON.stringify(keepFiltersAcrossCompanies),
     );
   }, [keepFiltersAcrossCompanies]);
 
@@ -3558,12 +4171,12 @@ export function FondoSection({
       localStorage.setItem("fondogeneral-toFilter", toFilter || "");
       localStorage.setItem(
         "fondogeneral-filterProviderCode",
-        filterProviderCode
+        filterProviderCode,
       );
       localStorage.setItem("fondogeneral-filterPaymentType", filterPaymentType);
       localStorage.setItem(
         "fondogeneral-filterEditedOnly",
-        JSON.stringify(filterEditedOnly)
+        JSON.stringify(filterEditedOnly),
       );
       localStorage.setItem("fondogeneral-searchQuery", searchQuery);
       localStorage.setItem("fondogeneral-pageSize", String(pageSize));
@@ -3676,10 +4289,88 @@ export function FondoSection({
   const isIngreso = isIngresoType(paymentType);
   const isEgreso = isEgresoType(paymentType) || isGastoType(paymentType);
 
+  useEffect(() => {
+    let isActive = true;
+
+    // Only needed when a superadmin is editing a movement, to allow selecting ANY user.
+    if (!isSuperAdminUser || !editingEntryId) {
+      setSuperAdminUsers([]);
+      setSuperAdminUsersLoading(false);
+      return () => {
+        isActive = false;
+      };
+    }
+
+    setSuperAdminUsersLoading(true);
+    UsersService.getUsersOrderedByName()
+      .then((users) => {
+        if (!isActive) return;
+        setSuperAdminUsers(Array.isArray(users) ? users : []);
+      })
+      .catch((err) => {
+        console.error(
+          "Error loading users for superadmin manager selector:",
+          err,
+        );
+        if (!isActive) return;
+        setSuperAdminUsers([]);
+      })
+      .finally(() => {
+        if (isActive) setSuperAdminUsersLoading(false);
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [isSuperAdminUser, editingEntryId]);
+
+  // Superadmin: when creating a movement, auto-assign the manager to themselves.
+  useEffect(() => {
+    if (!isSuperAdminUser) return;
+    if (!movementModalOpen) return;
+    if (editingEntryId) return;
+
+    const fallback = (user?.email || "").trim();
+    const name = (user?.name || "").trim() || fallback;
+    if (!name) return;
+
+    if (manager !== name) {
+      setManager(name);
+      setManagerError("");
+    }
+  }, [
+    isSuperAdminUser,
+    movementModalOpen,
+    editingEntryId,
+    user?.name,
+    user?.email,
+    manager,
+  ]);
+
   const employeeOptions = useMemo(() => {
-    const employees = companyEmployees.filter(
-      (name) => !!name && name.trim().length > 0
-    );
+    // Superadmin + editing: allow selecting ANY user.
+    if (isSuperAdminUser && editingEntryId) {
+      const unique = new Set<string>();
+      const push = (value: unknown) => {
+        const name = String(value || "").trim();
+        if (name) unique.add(name);
+      };
+
+      superAdminUsers.forEach((u) => push(u?.name));
+      // Ensure self is always selectable even if name doesn't exist in DB
+      push(user?.name);
+      push(user?.email);
+      // Keep current value visible/selectable even if it's not a known user
+      push(manager);
+
+      return Array.from(unique).sort((a, b) =>
+        a.localeCompare(b, "es", { sensitivity: "base" }),
+      );
+    }
+
+    const employees = companyEmployees
+      .map((name) => (typeof name === "string" ? name.trim() : ""))
+      .filter(Boolean);
 
     // Si el usuario actual es admin, agregarlo a la lista de empleados
     if (user?.role === "admin" && user?.name) {
@@ -3689,15 +4380,30 @@ export function FondoSection({
       }
     }
 
+    // Superadmin (create): include self so the manager can be auto-assigned.
+    if (isSuperAdminUser) {
+      const name = (user?.name || "").trim() || (user?.email || "").trim();
+      if (name && !employees.includes(name)) {
+        return [name, ...employees];
+      }
+    }
+
     return employees;
-  }, [companyEmployees, user]);
+  }, [
+    companyEmployees,
+    user,
+    isSuperAdminUser,
+    editingEntryId,
+    superAdminUsers,
+    manager,
+  ]);
 
   const editingEntry = useMemo(
     () =>
       editingEntryId
-        ? fondoEntries.find((entry) => entry.id === editingEntryId) ?? null
+        ? (fondoEntries.find((entry) => entry.id === editingEntryId) ?? null)
         : null,
-    [editingEntryId, fondoEntries]
+    [editingEntryId, fondoEntries],
   );
   const editingProviderCode = editingEntry?.providerCode ?? null;
 
@@ -3721,7 +4427,7 @@ export function FondoSection({
     let isMounted = true;
 
     const matchesSelectedCompany = (
-      storage?: MovementStorage<FondoEntry> | null
+      storage?: MovementStorage<FondoEntry> | null,
     ) => {
       if (!storage) return false;
       const storedCompany = (storage.company || "").trim();
@@ -3734,8 +4440,8 @@ export function FondoSection({
       try {
         const legacyOwnerKey = resolvedOwnerId
           ? MovimientosFondosService.buildLegacyOwnerMovementsKey(
-            resolvedOwnerId
-          )
+              resolvedOwnerId,
+            )
           : null;
         const parseTime = (value: string) => {
           const timestamp = Date.parse(value);
@@ -3750,18 +4456,18 @@ export function FondoSection({
         const buildEntriesFromStorage = (
           rawStorage: unknown,
           movementsOverride?: unknown[] | null,
-          targetAccountKey: MovementAccountKey = accountKeyRef.current
+          targetAccountKey: MovementAccountKey = accountKeyRef.current,
         ): StorageEntriesResult | null => {
           if (!rawStorage) return null;
           try {
             const storage =
               MovimientosFondosService.ensureMovementStorageShape<FondoEntry>(
                 rawStorage,
-                normalizedCompany
+                normalizedCompany,
               );
             const movements = Array.isArray(movementsOverride)
               ? (movementsOverride as unknown[])
-              : storage.operations?.movements ?? [];
+              : (storage.operations?.movements ?? []);
             const scopedEntries = movements.filter((rawEntry) => {
               const candidate = rawEntry as Partial<FondoEntry>;
               const movementAccount = isMovementAccountKey(candidate.accountId)
@@ -3772,7 +4478,7 @@ export function FondoSection({
             const entries = sanitizeFondoEntries(
               scopedEntries,
               undefined,
-              targetAccountKey
+              targetAccountKey,
             ).sort((a, b) => parseTime(b.createdAt) - parseTime(a.createdAt));
             return { entries, storage };
           } catch (err) {
@@ -3782,7 +4488,7 @@ export function FondoSection({
         };
 
         const buildEntriesFromRaw = (
-          rawData: string | null
+          rawData: string | null,
         ): StorageEntriesResult | null => {
           if (!rawData) return null;
           try {
@@ -3795,7 +4501,7 @@ export function FondoSection({
         };
 
         const loadRemoteEntries = async (
-          docKey: string
+          docKey: string,
         ): Promise<{
           result: StorageEntriesResult | null;
           status: "success" | "not-found" | "error";
@@ -3827,7 +4533,7 @@ export function FondoSection({
             } catch (listErr) {
               console.error(
                 `[FG-V2] Error listing v2 movements (${docKey}):`,
-                listErr
+                listErr,
               );
             }
 
@@ -3840,18 +4546,17 @@ export function FondoSection({
                 Array.isArray(legacyMovements) &&
                 legacyMovements.length > 0
               ) {
-                const hasAny = await MovimientosFondosService.hasAnyV2Movements(
-                  docKey
-                );
+                const hasAny =
+                  await MovimientosFondosService.hasAnyV2Movements(docKey);
                 if (!hasAny) {
                   console.warn(
                     `[FG-V2] Migrating legacy movements to v2 (${docKey})`,
-                    { legacyCount: legacyMovements.length }
+                    { legacyCount: legacyMovements.length },
                   );
                   const { migrated } =
                     await MovimientosFondosService.migrateLegacyMovementsToV2<FondoEntry>(
                       docKey,
-                      legacyMovements
+                      legacyMovements,
                     );
                   console.warn(`[FG-V2] Migration completed (${docKey})`, {
                     migrated,
@@ -3861,7 +4566,7 @@ export function FondoSection({
                   const cleaned =
                     MovimientosFondosService.ensureMovementStorageShape<FondoEntry>(
                       remoteStorage,
-                      normalizedCompany
+                      normalizedCompany,
                     );
                   cleaned.operations = { movements: [] };
                   await MovimientosFondosService.saveDocument(docKey, cleaned);
@@ -3877,7 +4582,7 @@ export function FondoSection({
             } catch (migrateErr) {
               console.error(
                 `[FG-V2] Error migrating legacy movements (${docKey}):`,
-                migrateErr
+                migrateErr,
               );
             }
 
@@ -3885,14 +4590,14 @@ export function FondoSection({
               result: buildEntriesFromStorage(
                 remoteStorage,
                 v2Movements,
-                accountKeyRef.current
+                accountKeyRef.current,
               ),
               status: "success",
             };
           } catch (err) {
             console.error(
               `Error reading fondo entries from Firestore (${docKey}):`,
-              err
+              err,
             );
             return { result: null, status: "error" };
           }
@@ -3949,7 +4654,7 @@ export function FondoSection({
         if (!hasResolvedSource && remoteConfirmedNotFound && !remoteAnyError) {
           const emptyStorage =
             MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
-              normalizedCompany
+              normalizedCompany,
             );
           storageSnapshotRef.current = emptyStorage;
           resolvedEntries = [];
@@ -3973,7 +4678,7 @@ export function FondoSection({
           legacyOwnerKey !== companyKey
         ) {
           assignResult(
-            buildEntriesFromRaw(localStorage.getItem(legacyOwnerKey))
+            buildEntriesFromRaw(localStorage.getItem(legacyOwnerKey)),
           );
         }
 
@@ -3986,19 +4691,19 @@ export function FondoSection({
               const parsedEntries = sanitizeFondoEntries(
                 legacyParsed,
                 undefined,
-                accountKeyRef.current
+                accountKeyRef.current,
               );
               if (parsedEntries.length > 0) {
                 resolvedEntries = parsedEntries;
                 const fallbackStorage =
                   MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
-                    normalizedCompany
+                    normalizedCompany,
                   );
                 fallbackStorage.operations.movements = parsedEntries.map(
                   (entry) => ({
                     ...entry,
                     accountId: accountKeyRef.current,
-                  })
+                  }),
                 );
                 storageSnapshotRef.current = fallbackStorage;
               }
@@ -4034,7 +4739,14 @@ export function FondoSection({
     return () => {
       isMounted = false;
     };
-  }, [namespace, resolvedOwnerId, company, applyLedgerStateFromStorage, beginMovementsLoading, endMovementsLoading]);
+  }, [
+    namespace,
+    resolvedOwnerId,
+    company,
+    applyLedgerStateFromStorage,
+    beginMovementsLoading,
+    endMovementsLoading,
+  ]);
 
   // When switching tabs, do not reload from Firestore: just filter cached v2 movements in-memory.
   useEffect(() => {
@@ -4055,10 +4767,10 @@ export function FondoSection({
     const entries = sanitizeFondoEntries(
       scopedEntries,
       undefined,
-      accountKey
+      accountKey,
     ).sort(
       (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
     setFondoEntries(entries);
 
@@ -4106,7 +4818,7 @@ export function FondoSection({
 
     const sortedEntries = [...fondoEntries].sort(
       (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
 
     let hasPendingCierreDeCaja = false;
@@ -4127,7 +4839,7 @@ export function FondoSection({
     setPendingCierreDeCaja(hasPendingCierreDeCaja);
     console.log(
       "[CIERRE-DEBUG] Estado pendingCierreDeCaja después de cargar:",
-      hasPendingCierreDeCaja
+      hasPendingCierreDeCaja,
     );
   }, [entriesHydrated, providers, fondoEntries]);
 
@@ -4142,154 +4854,198 @@ export function FondoSection({
   }, [providers, selectedProvider, editingEntryId, editingProviderCode]);
 
   useEffect(() => {
+    // Reset cached results when switching company/account.
     loadedDailyClosingKeysRef.current = new Set();
     loadingDailyClosingKeysRef.current = new Set();
     dailyClosingsRequestCountRef.current = 0;
+    dailyClosingHistoryRequestIdRef.current += 1;
     setDailyClosingsRefreshing(false);
     setDailyClosingsHydrated(false);
     setDailyClosings([]);
+  }, [company, accountKey]);
 
-    if (accountKey !== "FondoGeneral") {
-      setDailyClosingsHydrated(true);
-      return;
-    }
+  const resolveDailyClosingRangeBounds = useCallback(
+    (range: string): { fromTs: number; toTs: number } | null => {
+      if (!range || range === "todo") return null;
+      const now = new Date();
+      let from: Date | null = null;
+      let to: Date | null = null;
 
-    const normalizedCompany = (company || "").trim();
-    if (normalizedCompany.length === 0) {
-      setDailyClosingsHydrated(true);
-      return;
-    }
+      if (range === "today") {
+        const t = new Date(now);
+        from = t;
+        to = t;
+      } else if (range === "yesterday") {
+        const y = new Date(now);
+        y.setDate(y.getDate() - 1);
+        from = y;
+        to = y;
+      } else if (range === "thisweek") {
+        const d = new Date(now);
+        const day = d.getDay();
+        const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+        const start = new Date(d);
+        start.setDate(diff);
+        from = start;
+        to = new Date(now);
+      } else if (range === "lastweek") {
+        const d = new Date(now);
+        const day = d.getDay();
+        const diff = d.getDate() - day + (day === 0 ? -6 : 1) - 7;
+        const start = new Date(d);
+        start.setDate(diff);
+        const end = new Date(start);
+        end.setDate(start.getDate() + 6);
+        from = start;
+        to = end;
+      } else if (range === "lastmonth") {
+        from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        to = new Date(now.getFullYear(), now.getMonth(), 0);
+      } else if (range === "month") {
+        from = new Date(now.getFullYear(), now.getMonth(), 1);
+        to = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      } else if (range === "last30") {
+        const end = new Date(now);
+        const start = new Date(now);
+        start.setDate(start.getDate() - 29);
+        from = start;
+        to = end;
+      }
 
-    let isActive = true;
-    beginDailyClosingsRequest();
+      if (!from || !to) return null;
+      const fromTs = new Date(
+        from.getFullYear(),
+        from.getMonth(),
+        from.getDate(),
+        0,
+        0,
+        0,
+        0,
+      ).getTime();
+      const toTs = new Date(
+        to.getFullYear(),
+        to.getMonth(),
+        to.getDate(),
+        23,
+        59,
+        59,
+        999,
+      ).getTime();
+      return { fromTs, toTs };
+    },
+    [],
+  );
 
-    const loadClosings = async () => {
+  const loadDailyClosingsForHistoryRange = useCallback(
+    async (range: string) => {
+      if (accountKey !== "FondoGeneral") {
+        setDailyClosings([]);
+        setDailyClosingsHydrated(true);
+        return;
+      }
+
+      const normalizedCompany = (company || "").trim();
+      if (normalizedCompany.length === 0) {
+        setDailyClosings([]);
+        setDailyClosingsHydrated(true);
+        return;
+      }
+
+      const resolvedRange = range && range.length > 0 ? range : "today";
+
+      dailyClosingHistoryRequestIdRef.current += 1;
+      const requestId = dailyClosingHistoryRequestIdRef.current;
+      setDailyClosingsHydrated(false);
+      beginDailyClosingsRequest();
+
       try {
-        const document = await DailyClosingsService.getDocument(
-          normalizedCompany
-        );
-        if (!isActive) return;
-        if (document) {
-          const { records, loadedKeys } =
-            flattenDailyClosingsDocument(document);
-          setDailyClosings(records);
-          loadedDailyClosingKeysRef.current = loadedKeys;
-          return;
-        }
+        const bounds = resolveDailyClosingRangeBounds(resolvedRange);
+        const document =
+          await DailyClosingsService.getDocument(normalizedCompany);
+        if (!isComponentMountedRef.current) return;
+        if (requestId !== dailyClosingHistoryRequestIdRef.current) return;
 
-        if (!closingsStorageKey) {
-          setDailyClosings([]);
-          return;
-        }
-
-        const stored = localStorage.getItem(closingsStorageKey);
-        if (!stored) {
-          setDailyClosings([]);
-          return;
-        }
-        const parsed = JSON.parse(stored) as unknown;
-        setDailyClosings(sanitizeDailyClosings(parsed));
-      } catch (err) {
-        console.error("Error reading daily closings from Firestore:", err);
-        if (!isActive) return;
+        const base = document
+          ? DailyClosingsService.extractAllClosings(document)
+          : [];
 
         if (closingsStorageKey) {
           try {
+            localStorage.setItem(closingsStorageKey, JSON.stringify(base));
+          } catch (storageErr) {
+            console.error("Error storing daily closings:", storageErr);
+          }
+        }
+        const filtered = bounds
+          ? base.filter((record) => {
+              const ts = Date.parse(record?.closingDate ?? "");
+              if (Number.isNaN(ts)) return true;
+              if (ts < bounds.fromTs) return false;
+              if (ts > bounds.toTs) return false;
+              return true;
+            })
+          : base;
+        setDailyClosings(filtered);
+      } catch (err) {
+        console.error("Error reading daily closings from Firestore:", err);
+        if (!isComponentMountedRef.current) return;
+        if (requestId !== dailyClosingHistoryRequestIdRef.current) return;
+
+        try {
+          if (closingsStorageKey) {
             const stored = localStorage.getItem(closingsStorageKey);
             if (stored) {
               const parsed = JSON.parse(stored) as unknown;
-              setDailyClosings(sanitizeDailyClosings(parsed));
-              return;
+              const all = sanitizeDailyClosings(parsed);
+              const bounds = resolveDailyClosingRangeBounds(resolvedRange);
+              const filtered = bounds
+                ? all.filter((record) => {
+                    const ts = Date.parse(record?.closingDate ?? "");
+                    if (Number.isNaN(ts)) return true;
+                    if (ts < bounds.fromTs) return false;
+                    if (ts > bounds.toTs) return false;
+                    return true;
+                  })
+                : all;
+              setDailyClosings(filtered);
+            } else {
+              setDailyClosings([]);
             }
-          } catch (storageErr) {
-            console.error("Error reading stored daily closings:", storageErr);
+          } else {
+            setDailyClosings([]);
           }
+        } catch (storageErr) {
+          console.error("Error reading stored daily closings:", storageErr);
+          setDailyClosings([]);
         }
-        setDailyClosings([]);
       } finally {
-        if (isActive) {
+        if (
+          isComponentMountedRef.current &&
+          requestId === dailyClosingHistoryRequestIdRef.current
+        ) {
           setDailyClosingsHydrated(true);
         }
         finishDailyClosingsRequest();
       }
-    };
-
-    void loadClosings();
-
-    return () => {
-      isActive = false;
-    };
-  }, [
-    company,
-    accountKey,
-    closingsStorageKey,
-    beginDailyClosingsRequest,
-    finishDailyClosingsRequest,
-  ]);
+    },
+    [
+      accountKey,
+      company,
+      closingsStorageKey,
+      beginDailyClosingsRequest,
+      finishDailyClosingsRequest,
+      resolveDailyClosingRangeBounds,
+    ],
+  );
 
   useEffect(() => {
-    if (
-      !dailyClosingsHydrated ||
-      !closingsStorageKey ||
-      accountKey !== "FondoGeneral"
-    )
-      return;
-    try {
-      localStorage.setItem(closingsStorageKey, JSON.stringify(dailyClosings));
-    } catch (err) {
-      console.error("Error storing daily closings:", err);
-    }
-  }, [closingsStorageKey, dailyClosings, accountKey, dailyClosingsHydrated]);
-
-  useEffect(() => {
-    if (accountKey !== "FondoGeneral") return;
-    if (!dailyClosingsHydrated) return;
-    const normalizedCompany = (company || "").trim();
-    if (normalizedCompany.length === 0) return;
-    const targetKey = currentDailyKey;
-    if (!targetKey) return;
-    if (loadedDailyClosingKeysRef.current.has(targetKey)) return;
-    if (loadingDailyClosingKeysRef.current.has(targetKey)) return;
-
-    let isActive = true;
-    let shouldMarkLoaded = false;
-    loadingDailyClosingKeysRef.current.add(targetKey);
-    beginDailyClosingsRequest();
-
-    const loadByDay = async () => {
-      try {
-        const records = await DailyClosingsService.getClosingsForDate(
-          normalizedCompany,
-          targetKey
-        );
-        if (!isActive) return;
-        if (records.length > 0) {
-          setDailyClosings((prev) => mergeDailyClosingRecords(prev, records));
-        }
-        shouldMarkLoaded = true;
-      } catch (err) {
-        console.error("Error loading daily closings for selected day:", err);
-      } finally {
-        loadingDailyClosingKeysRef.current.delete(targetKey);
-        if (isActive && shouldMarkLoaded) {
-          loadedDailyClosingKeysRef.current.add(targetKey);
-        }
-        finishDailyClosingsRequest();
-      }
-    };
-
-    void loadByDay();
-
-    return () => {
-      isActive = false;
-    };
+    // Lazy-load: only query when the history modal is open.
+    if (!dailyClosingHistoryOpen) return;
+    void loadDailyClosingsForHistoryRange(dailyClosingHistoryRange);
   }, [
-    accountKey,
-    company,
-    currentDailyKey,
-    dailyClosingsHydrated,
-    beginDailyClosingsRequest,
-    finishDailyClosingsRequest,
+    dailyClosingHistoryOpen,
+    dailyClosingHistoryRange,
+    loadDailyClosingsForHistoryRange,
   ]);
 
   useEffect(() => {
@@ -4317,7 +5073,7 @@ export function FondoSection({
       .then((empresas) => {
         if (!isActive) return;
         const match = empresas.find(
-          (emp) => emp.name?.toLowerCase() === company.toLowerCase()
+          (emp) => emp.name?.toLowerCase() === company.toLowerCase(),
         );
         const names =
           match?.empleados?.map((emp) => emp.Empleado).filter(Boolean) ?? [];
@@ -4351,7 +5107,7 @@ export function FondoSection({
       .then((empresas) => {
         if (!isActive) return;
         const match = empresas.find(
-          (emp) => emp.name?.toLowerCase() === company.toLowerCase()
+          (emp) => emp.name?.toLowerCase() === company.toLowerCase(),
         );
         if (match) {
           setCompanyData(match);
@@ -4368,10 +5124,13 @@ export function FondoSection({
   }, [company]);
 
   useEffect(() => {
+    // Keep legacy validation for non-superadmin actors.
+    // Superadmin may select users outside the company employee list when editing.
+    if (isSuperAdminUser) return;
     if (manager && !employeeOptions.includes(manager)) {
       setManager("");
     }
-  }, [manager, employeeOptions]);
+  }, [manager, employeeOptions, isSuperAdminUser]);
 
   useEffect(() => {
     if (isIngreso) {
@@ -4406,7 +5165,7 @@ export function FondoSection({
   const sendMovementNotification = useCallback(
     async (
       entry: FondoEntry,
-      operationType: "create" | "edit"
+      operationType: "create" | "edit",
     ): Promise<void> => {
       try {
         // Buscar el proveedor para obtener su correonotifi
@@ -4456,25 +5215,25 @@ export function FondoSection({
             createdAt: serverTimestamp(),
           });
           console.log(
-            `[MAIL-DOC] Documento creado en 'mail' para movimiento: ${docRef.id}`
+            `[MAIL-DOC] Documento creado en 'mail' para movimiento: ${docRef.id}`,
           );
           showToast("Correo de notificación enviado correctamente", "success");
         } catch (err) {
           console.error(
             '[MAIL-DOC] Error creando documento en "mail" para movimiento:',
-            err
+            err,
           );
           showToast("Error al enviar correo de notificación", "error");
         }
       } catch (err) {
         console.error(
           "[EMAIL-NOTIFICATION] Error preparing notification:",
-          err
+          err,
         );
         // No lanzar error, la notificación es secundaria
       }
     },
-    [company, providers, showToast]
+    [company, providers, showToast],
   );
 
   /**
@@ -4489,8 +5248,17 @@ export function FondoSection({
         upsert?: FondoEntry;
         deleteId?: string;
         before?: FondoEntry | null;
-      }
-    ): Promise<{ ok: boolean; confirmed: boolean }> => {
+      },
+    ): Promise<{
+      ok: boolean;
+      confirmed: boolean;
+      ledgerSnapshot?: {
+        initialCRC: number;
+        currentCRC: number;
+        initialUSD: number;
+        currentUSD: number;
+      };
+    }> => {
       const normalizedCompany = (company || "").trim();
       if (normalizedCompany.length === 0) {
         console.error("[PERSIST-IMMEDIATE] No company specified");
@@ -4503,12 +5271,12 @@ export function FondoSection({
       try {
         const baseStorage = storageSnapshotRef.current
           ? MovimientosFondosService.ensureMovementStorageShape<FondoEntry>(
-            storageSnapshotRef.current,
-            normalizedCompany
-          )
+              storageSnapshotRef.current,
+              normalizedCompany,
+            )
           : MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
-            normalizedCompany
-          );
+              normalizedCompany,
+            );
 
         baseStorage.company = normalizedCompany;
 
@@ -4532,7 +5300,7 @@ export function FondoSection({
           value === "USD" ? "USD" : "CRC";
 
         const movementDelta = (
-          entry: Partial<FondoEntry> | null | undefined
+          entry: Partial<FondoEntry> | null | undefined,
         ): { currency: MovementCurrencyKey; delta: number } | null => {
           if (!entry) return null;
           const currency = normalizeCurrency(entry.currency);
@@ -4551,16 +5319,16 @@ export function FondoSection({
         const stateSnapshot =
           baseStorage.state ??
           MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
-            normalizedCompany
+            normalizedCompany,
           ).state;
 
         const existingCRC = stateSnapshot.balancesByAccount.find(
           (balance) =>
-            balance.accountId === accountKey && balance.currency === "CRC"
+            balance.accountId === accountKey && balance.currency === "CRC",
         );
         const existingUSD = stateSnapshot.balancesByAccount.find(
           (balance) =>
-            balance.accountId === accountKey && balance.currency === "USD"
+            balance.accountId === accountKey && balance.currency === "USD",
         );
 
         const prevInitialCRC = existingCRC
@@ -4611,7 +5379,7 @@ export function FondoSection({
         const nextCurrentUSD =
           prevCurrentUSD + (parsedInitialUSD - prevInitialUSD) + deltas.USD;
         const nextAccountBalances = stateSnapshot.balancesByAccount.filter(
-          (balance) => balance.accountId !== accountKey
+          (balance) => balance.accountId !== accountKey,
         );
         nextAccountBalances.push(
           {
@@ -4627,7 +5395,7 @@ export function FondoSection({
             enabled: currencyEnabled.USD,
             initialBalance: parsedInitialUSD,
             currentBalance: nextCurrentUSD,
-          }
+          },
         );
         stateSnapshot.balancesByAccount = nextAccountBalances;
         stateSnapshot.updatedAt = new Date().toISOString();
@@ -4639,40 +5407,45 @@ export function FondoSection({
         }
         baseStorage.state = stateSnapshot;
 
-        // Guardar en localStorage primero (solo snapshot/config/state; los movimientos viven en Firestore v2 cache)
-        try {
-          localStorage.setItem(companyKey, JSON.stringify(baseStorage));
-        } catch (storageError) {
-          // El snapshot ahora es pequeño; si falla, solo reportar.
-          console.warn(
-            "[PERSIST-IMMEDIATE] localStorage write failed:",
-            storageError
-          );
-        }
+        // Guardar en Firestore (ledger + movimiento) de forma ATÓMICA
+        console.log(
+          `[PERSIST-IMMEDIATE] Guardando ${operationType} a Firestore...`,
+          {
+            company: normalizedCompany,
+            accountKey,
+            entriesCount: updatedEntries.length,
+          },
+        );
 
-        // Persist movement change to v2 subcollection
+        let cacheUpdater: (() => void) | null = null;
+        let movementChange:
+          | { type: "upsert"; movement: FondoEntry & { id: string } }
+          | { type: "delete"; movementId: string }
+          | { type: "none" } = { type: "none" };
+
         if (operationType === "delete") {
           const deleteId = change?.deleteId;
           if (!deleteId) {
             throw new Error(
-              "[PERSIST-IMMEDIATE] delete requires change.deleteId"
+              "[PERSIST-IMMEDIATE] delete requires change.deleteId",
             );
           }
-          await MovimientosFondosService.deleteMovement(companyKey, deleteId);
-
-          const cached = v2MovementsCacheRef.current[companyKey];
-          if (cached?.loaded) {
-            v2MovementsCacheRef.current[companyKey] = {
-              ...cached,
-              loaded: true,
-              movements: cached.movements.filter((m) => m.id !== deleteId),
-            };
-          }
+          movementChange = { type: "delete", movementId: deleteId };
+          cacheUpdater = () => {
+            const cached = v2MovementsCacheRef.current[companyKey];
+            if (cached?.loaded) {
+              v2MovementsCacheRef.current[companyKey] = {
+                ...cached,
+                loaded: true,
+                movements: cached.movements.filter((m) => m.id !== deleteId),
+              };
+            }
+          };
         } else {
           const movement = change?.upsert;
           if (!movement) {
             throw new Error(
-              "[PERSIST-IMMEDIATE] create/edit requires change.upsert"
+              "[PERSIST-IMMEDIATE] create/edit requires change.upsert",
             );
           }
           const normalizedCurrency: MovementCurrencyKey =
@@ -4681,37 +5454,52 @@ export function FondoSection({
             ...(movement as FondoEntry),
             accountId: accountKey,
             currency: normalizedCurrency,
+            empresa: normalizedCompany,
           };
-          await MovimientosFondosService.upsertMovement(
-            companyKey,
-            storedMovement
-          );
+          movementChange = { type: "upsert", movement: storedMovement };
+          cacheUpdater = () => {
+            const cached = v2MovementsCacheRef.current[companyKey];
+            if (cached?.loaded) {
+              const next = [
+                storedMovement,
+                ...cached.movements.filter((m) => m.id !== storedMovement.id),
+              ];
+              v2MovementsCacheRef.current[companyKey] = {
+                ...cached,
+                loaded: true,
+                movements: next,
+              };
+            }
+          };
+        }
 
-          const cached = v2MovementsCacheRef.current[companyKey];
-          if (cached?.loaded) {
-            const next = [
-              storedMovement,
-              ...cached.movements.filter((m) => m.id !== storedMovement.id),
-            ];
-            v2MovementsCacheRef.current[companyKey] = {
-              ...cached,
-              loaded: true,
-              movements: next,
-            };
+        await MovimientosFondosService.commitLedgerAndMovement(
+          companyKey,
+          baseStorage,
+          movementChange,
+        );
+
+        if (cacheUpdater) {
+          try {
+            cacheUpdater();
+          } catch (cacheErr) {
+            console.warn(
+              "[PERSIST-IMMEDIATE] cache update failed after commit:",
+              cacheErr,
+            );
           }
         }
 
-        // Guardar en Firestore - ESTA ES LA PARTE CRÍTICA
-        console.log(
-          `[PERSIST-IMMEDIATE] Guardando ${operationType} a Firestore...`,
-          {
-            company: normalizedCompany,
-            accountKey,
-            entriesCount: updatedEntries.length,
-          }
-        );
-
-        await MovimientosFondosService.saveDocument(companyKey, baseStorage);
+        // Guardar snapshot liviano en localStorage DESPUÉS del commit.
+        // Esto evita que un fallo de Firestore deje un snapshot local inconsistente.
+        try {
+          localStorage.setItem(companyKey, JSON.stringify(baseStorage));
+        } catch (storageError) {
+          console.warn(
+            "[PERSIST-IMMEDIATE] localStorage write failed:",
+            storageError,
+          );
+        }
 
         // setDoc puede resolver con escritura local; esperamos un poco por confirmación del backend
         // para evitar casos de "se guardó" cuando el usuario estaba offline/intermitente.
@@ -4725,37 +5513,38 @@ export function FondoSection({
             new Promise<void>((_, reject) => {
               setTimeout(
                 () => reject(new Error("waitForPendingWrites timeout")),
-                timeoutMs
+                timeoutMs,
               );
             }),
           ]);
         } catch (pendingErr) {
           console.warn(
             `[PERSIST-IMMEDIATE] ⚠️ ${operationType} guardado localmente pero sin confirmación del servidor aún`,
-            pendingErr
+            pendingErr,
           );
         }
 
         console.log(
-          `[PERSIST-IMMEDIATE] ✅ ${operationType} guardado (confirmed=${confirmed})`
+          `[PERSIST-IMMEDIATE] ✅ ${operationType} guardado (confirmed=${confirmed})`,
         );
 
         // Actualizar snapshot después de guardar
         storageSnapshotRef.current = baseStorage;
 
-        // Refrescar snapshot de balances para UI (independiente de filtros)
-        setLedgerSnapshot({
-          initialCRC: parsedInitialCRC,
-          currentCRC: nextCurrentCRC,
-          initialUSD: parsedInitialUSD,
-          currentUSD: nextCurrentUSD,
-        });
-
-        return { ok: true, confirmed };
+        return {
+          ok: true,
+          confirmed,
+          ledgerSnapshot: {
+            initialCRC: parsedInitialCRC,
+            currentCRC: nextCurrentCRC,
+            initialUSD: parsedInitialUSD,
+            currentUSD: nextCurrentUSD,
+          },
+        };
       } catch (err) {
         console.error(
           `[PERSIST-IMMEDIATE] ❌ Error guardando ${operationType} a Firestore:`,
-          err
+          err,
         );
         return { ok: false, confirmed: false };
       }
@@ -4766,12 +5555,257 @@ export function FondoSection({
       initialAmount,
       initialAmountUSD,
       currencyEnabled,
-      setLedgerSnapshot,
-    ]
+      ledgerSnapshot,
+    ],
+  );
+
+  const latestDailyClosing = useMemo(() => {
+    if (!dailyClosings || dailyClosings.length === 0) return null;
+    const sorted = dailyClosings
+      .slice()
+      .sort((a, b) => dailyClosingSortValue(b) - dailyClosingSortValue(a));
+    return sorted[0] ?? null;
+  }, [dailyClosings]);
+
+  const latestDailyClosingLabel = useMemo(() => {
+    if (!latestDailyClosing) return "";
+    try {
+      const localDailyClosingDateFormatter = new Intl.DateTimeFormat("es-CR", {
+        dateStyle: "long",
+      });
+      const localDateTimeFormatter = new Intl.DateTimeFormat("es-CR", {
+        dateStyle: "short",
+        timeStyle: "short",
+      });
+      const closingDate = new Date(latestDailyClosing.closingDate);
+      const closingLabel = Number.isNaN(closingDate.getTime())
+        ? String(latestDailyClosing.closingDate)
+        : localDailyClosingDateFormatter.format(closingDate);
+      const createdAtDate = new Date(latestDailyClosing.createdAt);
+      const createdLabel = Number.isNaN(createdAtDate.getTime())
+        ? String(latestDailyClosing.createdAt)
+        : localDateTimeFormatter.format(createdAtDate);
+      return `${closingLabel} (registrado: ${createdLabel})`;
+    } catch {
+      return String(
+        latestDailyClosing.closingDate || latestDailyClosing.createdAt || "",
+      );
+    }
+  }, [latestDailyClosing]);
+
+  const handleDeleteLatestDailyClosing = useCallback(
+    async (reason: string): Promise<void> => {
+      if (!isSuperAdminUser) {
+        throw new Error("No autorizado");
+      }
+
+      const normalizedCompany = (company || "").trim();
+      if (!normalizedCompany) {
+        throw new Error("No se pudo identificar la empresa");
+      }
+
+      if (accountKey !== "FondoGeneral") {
+        throw new Error("Esta acción solo aplica al Fondo General");
+      }
+
+      const trimmedReason = String(reason || "").trim();
+      if (!trimmedReason) {
+        throw new Error("Debe indicar un motivo");
+      }
+
+      if (deleteLatestClosingInProgressRef.current) {
+        throw new Error("Ya hay una eliminación en progreso");
+      }
+      deleteLatestClosingInProgressRef.current = true;
+
+      try {
+        // Fuente de verdad: documento en Firestore
+        const closingsDoc =
+          await DailyClosingsService.getDocument(normalizedCompany);
+        if (!closingsDoc) {
+          throw new Error(
+            "No se encontró historial de cierres para esta empresa",
+          );
+        }
+
+        const sorted = DailyClosingsService.extractAllClosings(closingsDoc);
+        const latest = sorted[0];
+        if (!latest) {
+          throw new Error("No hay cierres para eliminar");
+        }
+        const latestAfter = sorted[1] ?? null;
+
+        const companyKey =
+          MovimientosFondosService.buildCompanyMovementsKey(normalizedCompany);
+
+        // Buscar ajustes vinculados al cierre (aunque no estén cargados en el rango actual)
+        const related =
+          await MovimientosFondosService.listMovementsByOriginalEntryId<FondoEntry>(
+            companyKey,
+            latest.id,
+            { limitCount: 50 },
+          );
+
+        const relatedAdjustments = (related || []).filter((m) =>
+          isAutoAdjustmentProvider((m as any)?.providerCode),
+        );
+
+        const lockedUntilBefore =
+          storageSnapshotRef.current?.state?.lockedUntil ?? null;
+        const lockedUntilAfter = latestAfter?.createdAt ?? null;
+
+        // 1) Eliminar el cierre y guardar respaldo en cierresEliminados (respaldo primero)
+        await DailyClosingsService.deleteLatestClosing(normalizedCompany, {
+          expectedClosingId: latest.id,
+          reason: trimmedReason,
+          deletedBy: {
+            uid: (user as any)?.id,
+            email: user?.email,
+            name: user?.name,
+            role: user?.role,
+          },
+          relatedAdjustments,
+          lockedUntilBefore,
+          lockedUntilAfter,
+        });
+
+        setDailyClosings((prev) => prev.filter((d) => d.id !== latest.id));
+        setExpandedClosings((prev) => {
+          const next = new Set(prev);
+          next.delete(latest.id);
+          return next;
+        });
+
+        // 2) Eliminar movimientos de ajuste para revertir el saldo
+        let latestLedgerSnapshot: {
+          initialCRC: number;
+          currentCRC: number;
+          initialUSD: number;
+          currentUSD: number;
+        } | null = null;
+
+        for (const adj of relatedAdjustments) {
+          const before =
+            fondoEntries.find((e) => e.id === adj.id) ?? (adj as any);
+          const saved = await persistMovementToFirestore(
+            fondoEntries,
+            "delete",
+            {
+              deleteId: adj.id,
+              before,
+            },
+          );
+          if (!saved.ok) {
+            throw new Error(
+              "El cierre fue eliminado, pero no se pudo borrar un ajuste al saldo asociado. Revise los movimientos.",
+            );
+          }
+          if (saved.ledgerSnapshot) {
+            latestLedgerSnapshot = saved.ledgerSnapshot;
+          }
+        }
+
+        if (relatedAdjustments.length > 0) {
+          const ids = new Set(relatedAdjustments.map((a) => a.id));
+          setFondoEntries((prev) => prev.filter((e) => !ids.has(e.id)));
+          if (latestLedgerSnapshot) {
+            setLedgerSnapshot(latestLedgerSnapshot);
+          }
+        }
+
+        // 3) Ajustar lockedUntil al cierre anterior (o removerlo si ya no hay cierres)
+        const baseLedger = storageSnapshotRef.current
+          ? MovimientosFondosService.ensureMovementStorageShape<FondoEntry>(
+              storageSnapshotRef.current,
+              normalizedCompany,
+            )
+          : ((await MovimientosFondosService.getDocument<FondoEntry>(
+              companyKey,
+            )) ??
+            MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
+              normalizedCompany,
+            ));
+
+        baseLedger.company = normalizedCompany;
+        baseLedger.operations = { movements: [] };
+        if (!baseLedger.state) {
+          baseLedger.state =
+            MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
+              normalizedCompany,
+            ).state;
+        }
+        if (lockedUntilAfter) {
+          baseLedger.state.lockedUntil = lockedUntilAfter;
+        } else {
+          delete (baseLedger.state as any).lockedUntil;
+        }
+        baseLedger.state.updatedAt = new Date().toISOString();
+
+        await MovimientosFondosService.saveDocument(companyKey, baseLedger);
+        storageSnapshotRef.current = baseLedger;
+        try {
+          localStorage.setItem(companyKey, JSON.stringify(baseLedger));
+        } catch {
+          // ignore storage errors
+        }
+
+        // Si acabamos de eliminar el último cierre, no tiene sentido pedir confirmación de conteo físico
+        // para el “primer movimiento después del cierre”.
+        try {
+          const key = buildPhysicalCountStorageKey();
+          if (key) localStorage.setItem(key, "false");
+          cleanupPhysicalCountLegacyKeys();
+        } catch {
+          // ignore
+        }
+        setPendingCierreDeCaja(false);
+
+        // Reset cross-device lock + local cooldowns so user can re-do either closing immediately.
+        await forceClearClosingGuards(
+          normalizedCompany,
+          "delete_latest_fondo_general",
+        );
+        try {
+          lastDailyClosingSavedAtRef.current = 0;
+          lastMovementCreatedAtRef.current = 0;
+          lastMovementDedupeRef.current = null;
+          if (typeof window !== "undefined") {
+            const dailyKey = `fondogeneral-lastDailyClosingSavedAt:${normalizedCompany}`;
+            const createdKey = `fondogeneral-lastMovementCreatedAt:${normalizedCompany}:${accountKey}`;
+            const dedupeKey = `fondogeneral-lastMovementDedupe:${normalizedCompany}:${accountKey}`;
+            localStorage.removeItem(dailyKey);
+            localStorage.removeItem(createdKey);
+            localStorage.removeItem(dedupeKey);
+          }
+        } catch {
+          // ignore
+        }
+
+        showToast("Último cierre eliminado", "success", 4000);
+      } finally {
+        deleteLatestClosingInProgressRef.current = false;
+      }
+    },
+    [
+      isSuperAdminUser,
+      company,
+      accountKey,
+      user,
+      fondoEntries,
+      persistMovementToFirestore,
+      isAutoAdjustmentProvider,
+      buildPhysicalCountStorageKey,
+      cleanupPhysicalCountLegacyKeys,
+      forceClearClosingGuards,
+      showToast,
+    ],
   );
 
   const persistCreatedMovement = useCallback(
-    async (entry: FondoEntry, updatedEntries: FondoEntry[]): Promise<void> => {
+    async (
+      entry: FondoEntry,
+      updatedEntries: FondoEntry[],
+    ): Promise<boolean> => {
       // PRIMERO persistir a Firestore, LUEGO actualizar UI
       const saved = await persistMovementToFirestore(updatedEntries, "create", {
         upsert: entry,
@@ -4781,10 +5815,44 @@ export function FondoSection({
         showToast(
           "Error al guardar el movimiento. Por favor, intente de nuevo.",
           "error",
-          5000
+          5000,
         );
         editingInProgressRef.current = false;
-        return;
+        return false;
+      }
+
+      // Mark a dedupe window after a successful save (prevents instant duplicates)
+      try {
+        const normalizedCompany = (company || "").trim();
+        if (normalizedCompany.length > 0) {
+          const savedAtMs = Date.now();
+          const fingerprintParts = [
+            `provider=${entry.providerCode || ""}`,
+            `invoice=${entry.invoiceNumber || ""}`,
+            `type=${entry.paymentType || ""}`,
+            `egreso=${Math.trunc(entry.amountEgreso || 0)}`,
+            `ingreso=${Math.trunc(entry.amountIngreso || 0)}`,
+            `manager=${(entry.manager || "").trim()}`,
+            `currency=${(entry as any).currency || "CRC"}`,
+            `notes=${(entry.notes || "").trim()}`,
+          ];
+          const fingerprint = fingerprintParts.join("|");
+          const payload = { at: savedAtMs, fingerprint };
+          lastMovementDedupeRef.current = payload;
+          lastMovementCreatedAtRef.current = savedAtMs;
+          if (typeof window !== "undefined") {
+            const key = `fondogeneral-lastMovementDedupe:${normalizedCompany}:${accountKey}`;
+            const createdKey = `fondogeneral-lastMovementCreatedAt:${normalizedCompany}:${accountKey}`;
+            try {
+              localStorage.setItem(key, JSON.stringify(payload));
+              localStorage.setItem(createdKey, String(savedAtMs));
+            } catch {
+              // ignore storage errors
+            }
+          }
+        }
+      } catch {
+        // ignore
       }
 
       // Limpiar flag de edición en progreso
@@ -4792,13 +5860,16 @@ export function FondoSection({
 
       // Solo actualizar la UI si el guardado fue exitoso
       setFondoEntries(updatedEntries);
+      if (saved.ledgerSnapshot) {
+        setLedgerSnapshot(saved.ledgerSnapshot);
+      }
       if (saved.confirmed) {
         showToast("Movimiento guardado correctamente", "success", 3000);
       } else {
         showToast(
           "Movimiento guardado localmente; pendiente de sincronización (revisa tu conexión).",
           "warning",
-          6000
+          6000,
         );
       }
 
@@ -4806,12 +5877,26 @@ export function FondoSection({
       sendMovementNotification(entry, "create").catch((err) => {
         console.error(
           "[NOTIFICATION] Error en notificación de movimiento:",
-          err
+          err,
         );
       });
 
+      // Si hubo un cierre pendiente (marca en localStorage), al crear un movimiento manual se borra.
+      if (
+        accountKey === "FondoGeneral" &&
+        !isAutoAdjustmentProvider(entry.providerCode)
+      ) {
+        try {
+          const key = buildPhysicalCountStorageKey();
+          if (key) localStorage.setItem(key, "false");
+          cleanupPhysicalCountLegacyKeys();
+        } catch {
+          // ignore storage errors
+        }
+      }
+
       const selectedProviderData = providers.find(
-        (p) => p.code === entry.providerCode
+        (p) => p.code === entry.providerCode,
       );
       if (
         selectedProviderData?.name?.toUpperCase() ===
@@ -4823,16 +5908,23 @@ export function FondoSection({
       if (!movementAutoCloseLocked) {
         setMovementModalOpen(false);
       }
+
+      return true;
     },
     [
       persistMovementToFirestore,
       showToast,
       sendMovementNotification,
       providers,
+      accountKey,
+      company,
+      buildPhysicalCountStorageKey,
+      cleanupPhysicalCountLegacyKeys,
       resetFondoForm,
       movementAutoCloseLocked,
       setFondoEntries,
-    ]
+      setLedgerSnapshot,
+    ],
   );
 
   const cancelOpenCreateMovement = useCallback(() => {
@@ -4841,7 +5933,7 @@ export function FondoSection({
 
   const handleSubmitFondo = async () => {
     if (!company) return;
-    if (isSaving) return; // Prevenir múltiples envíos
+    if (isSaving || movementSubmitInProgressRef.current) return; // Prevenir múltiples envíos
 
     let hasErrors = false;
 
@@ -4894,7 +5986,127 @@ export function FondoSection({
     if (isEgreso && (Number.isNaN(egresoValue) || egresoValue <= 0)) return;
     if (isIngreso && (Number.isNaN(ingresoValue) || ingresoValue <= 0)) return;
 
+    // Validar que no quede con saldo negativo
+    if (isEgreso && !editingEntryId && isRegularUser) {
+      const currentBalance =
+        movementCurrency === "USD"
+          ? ledgerSnapshot.currentUSD
+          : ledgerSnapshot.currentCRC;
+      const resultingBalance = currentBalance - egresoValue;
+      console.log(
+        `Validando saldo negativo: currentBalance=${currentBalance}, egresoValue=${egresoValue}, resultingBalance=${resultingBalance}`,
+      );
+
+      if (resultingBalance < 0) {
+        setNegativeBalanceModal({
+          open: true,
+          amount: egresoValue,
+          currency: movementCurrency,
+          resultingNegativeAmount: resultingBalance,
+        });
+        setIsSaving(false);
+        return;
+      }
+    }
+
     const paddedInvoice = invoiceNumber.padStart(4, "0");
+
+    // Dedupe window only for NEW movements (edits remain allowed)
+    if (!editingEntryId) {
+      try {
+        const normalizedCompany = (company || "").trim();
+        if (normalizedCompany.length > 0) {
+          // Enforce minimum interval between ANY new movements
+          const nowMs = Date.now();
+          const createdKey = `fondogeneral-lastMovementCreatedAt:${normalizedCompany}:${accountKey}`;
+          let lastCreatedAtMs = lastMovementCreatedAtRef.current;
+          if (typeof window !== "undefined") {
+            try {
+              const stored = Number(localStorage.getItem(createdKey));
+              if (Number.isFinite(stored) && stored > 0) {
+                lastCreatedAtMs = Math.max(lastCreatedAtMs, stored);
+              }
+            } catch {
+              // ignore
+            }
+          }
+
+          // Admins/Superadmins are exempt from the 1-minute cooldown.
+          if (
+            !isAdminUser &&
+            !isSuperAdminUser &&
+            lastCreatedAtMs > 0 &&
+            nowMs - lastCreatedAtMs < MOVEMENT_MIN_INTERVAL_MS
+          ) {
+            const remainingMs =
+              MOVEMENT_MIN_INTERVAL_MS - (nowMs - lastCreatedAtMs);
+            const remainingSec = Math.ceil(remainingMs / 1000);
+            showToast(
+              `Espere ${formatToastWaitTime(remainingSec)} para agregar otro movimiento.`,
+              "warning",
+              5000,
+            );
+            return;
+          }
+
+          const fingerprintParts = [
+            `provider=${selectedProvider || ""}`,
+            `invoice=${paddedInvoice || ""}`,
+            `type=${paymentType || ""}`,
+            `egreso=${Math.trunc(isEgreso ? egresoValue : 0)}`,
+            `ingreso=${Math.trunc(isIngreso ? ingresoValue : 0)}`,
+            `manager=${(manager || "").trim()}`,
+            `currency=${movementCurrency || "CRC"}`,
+            `notes=${trimmedNotes}`,
+          ];
+          const fingerprint = fingerprintParts.join("|");
+          const key = `fondogeneral-lastMovementDedupe:${normalizedCompany}:${accountKey}`;
+
+          let last = lastMovementDedupeRef.current;
+          if (!last && typeof window !== "undefined") {
+            try {
+              const raw = localStorage.getItem(key);
+              if (raw) {
+                const parsed = JSON.parse(raw) as any;
+                if (
+                  parsed &&
+                  typeof parsed.at === "number" &&
+                  typeof parsed.fingerprint === "string"
+                ) {
+                  last = { at: parsed.at, fingerprint: parsed.fingerprint };
+                }
+              }
+            } catch {
+              // ignore
+            }
+          }
+
+          if (
+            last &&
+            last.fingerprint === fingerprint &&
+            nowMs - last.at < MOVEMENT_DUPLICATE_WINDOW_MS
+          ) {
+            const remainingMs =
+              MOVEMENT_DUPLICATE_WINDOW_MS - (nowMs - last.at);
+            const remainingSec = Math.ceil(remainingMs / 1000);
+            showToast(
+              `Movimiento duplicado detectado. Espere ${formatToastWaitTime(
+                remainingSec,
+              )} para volver a guardarlo.`,
+              "warning",
+              5000,
+            );
+            return;
+          }
+
+          // lock immediately to avoid double-click duplicates before state updates
+          movementSubmitInProgressRef.current = true;
+        }
+      } catch {
+        // If dedupe fails for any reason, still lock to prevent double-submit
+        movementSubmitInProgressRef.current = true;
+      }
+    }
 
     setIsSaving(true);
 
@@ -4910,11 +6122,11 @@ export function FondoSection({
         const changes: string[] = [];
         if (selectedProvider !== original.providerCode)
           changes.push(
-            `Proveedor: ${original.providerCode} → ${selectedProvider}`
+            `Proveedor: ${original.providerCode} → ${selectedProvider}`,
           );
         if (paddedInvoice !== original.invoiceNumber)
           changes.push(
-            `N° factura: ${original.invoiceNumber} → ${paddedInvoice}`
+            `N° factura: ${original.invoiceNumber} → ${paddedInvoice}`,
           );
         if (paymentType !== original.paymentType)
           changes.push(`Tipo: ${original.paymentType} → ${paymentType}`);
@@ -4957,7 +6169,7 @@ export function FondoSection({
           if (history.length >= MAX_AUDIT_EDITS) {
             showToast(
               `No se pueden realizar más de ${MAX_AUDIT_EDITS} ediciones en un mismo movimiento`,
-              "error"
+              "error",
             );
             return e; // No permitir más ediciones
           }
@@ -4983,7 +6195,7 @@ export function FondoSection({
               manager,
               notes: trimmedNotes,
               currency: movementCurrency,
-            }
+            },
           );
           const newRecord = { at: new Date().toISOString(), ...changedFields };
           history.push(newRecord);
@@ -5018,7 +6230,7 @@ export function FondoSection({
           showToast(
             "Error al guardar el movimiento. Por favor, intente de nuevo.",
             "error",
-            5000
+            5000,
           );
           setIsSaving(false);
           editingInProgressRef.current = false;
@@ -5031,13 +6243,16 @@ export function FondoSection({
 
         // Solo actualizar la UI si el guardado fue exitoso
         setFondoEntries(updatedEntries);
+        if (saved.ledgerSnapshot) {
+          setLedgerSnapshot(saved.ledgerSnapshot);
+        }
         if (saved.confirmed) {
           showToast("Movimiento editado correctamente", "success", 3000);
         } else {
           showToast(
             "Edición guardada localmente; pendiente de sincronización (revisa tu conexión).",
             "warning",
-            6000
+            6000,
           );
         }
 
@@ -5047,7 +6262,7 @@ export function FondoSection({
           sendMovementNotification(editedEntry, "edit").catch((err) => {
             console.error(
               "[NOTIFICATION] Error en notificación de movimiento editado:",
-              err
+              err,
             );
           });
         }
@@ -5077,7 +6292,7 @@ export function FondoSection({
         } catch {
           console.info(
             "[FG-DEBUG] Edited movement saved (error computing debug balances)",
-            editingEntryId
+            editingEntryId,
           );
         }
 
@@ -5090,37 +6305,124 @@ export function FondoSection({
       }
 
       // CREAR nuevo movimiento
-      const now = new Date();
-      const iso = now.toISOString();
-      // Use local time for the document id to avoid UTC surprises when searching by hour.
-      const yyyy = now.getFullYear();
-      const MM = String(now.getMonth() + 1).padStart(2, "0");
-      const DD = String(now.getDate()).padStart(2, "0");
-      const HH = String(now.getHours()).padStart(2, "0");
-      const mm = String(now.getMinutes()).padStart(2, "0");
-      const ss = String(now.getSeconds()).padStart(2, "0");
-      const mmm = String(now.getMilliseconds()).padStart(3, "0");
-      const dateKey = `${yyyy}_${MM}_${DD}`; // YYYY_MM_DD (local)
-      const timeKey = `${HH}_${mm}_${ss}_${mmm}`; // HH_MM_SS_mmm (local, URL-safe)
-      const movementId = `${dateKey}-${timeKey}_${accountKey}`;
-      const entry: FondoEntry = {
-        id: movementId,
-        providerCode: selectedProvider,
-        invoiceNumber: paddedInvoice,
-        paymentType,
-        amountEgreso: isEgreso ? egresoValue : 0,
-        amountIngreso: isIngreso ? ingresoValue : 0,
-        manager,
-        notes: trimmedNotes,
-        createdAt: iso,
-        currency: movementCurrency,
-      };
+      // If this is a CIERRE FONDO VENTAS movement, prevent concurrent Fondo General closings (and vice versa)
+      let closingGuard: { token: string; docId: string } | null = null;
+      try {
+        const normalizedCompany = (company || "").trim();
+        const selectedProviderData = providers.find(
+          (p) => p.code === selectedProvider,
+        );
+        const isCierreVentas =
+          selectedProviderData?.name?.toUpperCase() ===
+          CIERRE_FONDO_VENTAS_PROVIDER_NAME;
+        // Enforce cross-device guard ONLY for regular users.
+        // Admin/superadmin are allowed to create a closing even during the lock window.
+        if (normalizedCompany.length > 0 && isCierreVentas && isRegularUser) {
+          const acquired = await acquireClosingGuard(
+            normalizedCompany,
+            "FONDO_VENTAS",
+          );
+          if (!acquired.ok) {
+            const kindLabel =
+              acquired.lockedKind === "FONDO_GENERAL"
+                ? "Fondo General"
+                : acquired.lockedKind === "FONDO_VENTAS"
+                  ? "Fondo Ventas"
+                  : "otro cierre";
+            showToast(
+              `Otro cierre (${kindLabel}) se está registrando. Intente en ${formatToastWaitTime(
+                acquired.remainingSec,
+              )}.`,
+              "warning",
+              6000,
+            );
+            return;
+          }
+          closingGuard = { token: acquired.token, docId: acquired.docId };
+        }
 
-      // Preparar la lista actualizada ANTES de persistir
-      const updatedEntries = [entry, ...fondoEntries];
-      await persistCreatedMovement(entry, updatedEntries);
+        const now = new Date();
+        const iso = now.toISOString();
+        // Use local time for the document id to avoid UTC surprises when searching by hour.
+        const yyyy = now.getFullYear();
+        const MM = String(now.getMonth() + 1).padStart(2, "0");
+        const DD = String(now.getDate()).padStart(2, "0");
+        const HH = String(now.getHours()).padStart(2, "0");
+        const mm = String(now.getMinutes()).padStart(2, "0");
+        const ss = String(now.getSeconds()).padStart(2, "0");
+        const mmm = String(now.getMilliseconds()).padStart(3, "0");
+        const dateKey = `${yyyy}_${MM}_${DD}`; // YYYY_MM_DD (local)
+        const timeKey = `${HH}_${mm}_${ss}_${mmm}`; // HH_MM_SS_mmm (local, URL-safe)
+        const movementId = `${dateKey}-${timeKey}_${accountKey}`;
+        const entry: FondoEntry = {
+          id: movementId,
+          providerCode: selectedProvider,
+          invoiceNumber: paddedInvoice,
+          paymentType,
+          amountEgreso: isEgreso ? egresoValue : 0,
+          amountIngreso: isIngreso ? ingresoValue : 0,
+          manager,
+          notes: trimmedNotes,
+          createdAt: iso,
+          currency: movementCurrency,
+        };
+
+        // Preparar la lista actualizada ANTES de persistir
+        const updatedEntries = [entry, ...fondoEntries];
+        const createdOk = await persistCreatedMovement(entry, updatedEntries);
+
+        if (createdOk) {
+          try {
+            if (normalizedCompany.length > 0) {
+              await ProvidersService.incrementMovementCount(
+                normalizedCompany,
+                selectedProvider,
+              );
+            }
+          } catch (err) {
+            console.warn(
+              "[FG] Could not increment provider movement count:",
+              err,
+            );
+          }
+        }
+
+        // If an admin/superadmin created a cierre, touch the guard on success so regular users
+        // are blocked for the lock window.
+        if (
+          createdOk &&
+          normalizedCompany.length > 0 &&
+          isCierreVentas &&
+          !isRegularUser
+        ) {
+          void touchClosingGuard(normalizedCompany, "FONDO_VENTAS");
+        }
+
+        // If save failed, release guard so user can retry immediately.
+        if (!createdOk && closingGuard) {
+          try {
+            if (normalizedCompany.length > 0) {
+              void releaseClosingGuard(normalizedCompany, closingGuard);
+            }
+          } catch {
+            // ignore
+          }
+        }
+      } catch (err) {
+        // Unexpected error: release guard to avoid blocking retries.
+        try {
+          const normalizedCompany = (company || "").trim();
+          if (closingGuard && normalizedCompany.length > 0) {
+            void releaseClosingGuard(normalizedCompany, closingGuard);
+          }
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
     } finally {
       setIsSaving(false);
+      movementSubmitInProgressRef.current = false;
     }
   };
 
@@ -5133,7 +6435,7 @@ export function FondoSection({
       showToast(
         "Ya hay una edición en progreso. Completa o cancela la edición actual antes de editar otro movimiento.",
         "warning",
-        5000
+        5000,
       );
       return;
     }
@@ -5142,7 +6444,7 @@ export function FondoSection({
       showToast(
         "Debes esperar un momento antes de editar otro movimiento.",
         "warning",
-        4000
+        4000,
       );
       return;
     }
@@ -5168,12 +6470,12 @@ export function FondoSection({
       isEgresoType(correctPaymentType) || isGastoType(correctPaymentType);
     if (isEgreso) {
       setEgreso(
-        Math.trunc(entry.amountEgreso || entry.amountIngreso).toString()
+        Math.trunc(entry.amountEgreso || entry.amountIngreso).toString(),
       );
       setIngreso("");
     } else {
       setIngreso(
-        Math.trunc(entry.amountIngreso || entry.amountEgreso).toString()
+        Math.trunc(entry.amountIngreso || entry.amountEgreso).toString(),
       );
       setEgreso("");
     }
@@ -5212,15 +6514,25 @@ export function FondoSection({
         return false;
       }
     },
-    [accountKey]
+    [accountKey],
   );
 
   const handleEditMovement = (entry: FondoEntry) => {
+    // Superadmin should not edit "CIERRE FONDO VENTAS"; they should delete it.
+    if (isSuperAdminUser && isCierreFondoVentasMovement(entry)) {
+      showToast(
+        'Este "CIERRE FONDO VENTAS" no se edita. Debe eliminarse.',
+        "info",
+        5000,
+      );
+      return;
+    }
+
     if (isMovementLocked(entry)) {
       showToast(
         "Este movimiento está bloqueado (anterior al último cierre).",
         "info",
-        5000
+        5000,
       );
       return;
     }
@@ -5271,20 +6583,113 @@ export function FondoSection({
     return String(user.id) === String(companyData.ownerId);
   }, [user, companyData]);
 
+  const cierreFondoVentasProviderCode = useMemo(() => {
+    const found = providers.find(
+      (p) =>
+        (p?.name || "").toString().toUpperCase() ===
+        CIERRE_FONDO_VENTAS_PROVIDER_NAME,
+    );
+    return found?.code || null;
+  }, [providers]);
+
+  const latestCierreFondoVentasMovementId = useMemo(() => {
+    if (!fondoEntries || fondoEntries.length === 0) return null;
+
+    const isVentas = (e: FondoEntry) => {
+      if (cierreFondoVentasProviderCode) {
+        return e.providerCode === cierreFondoVentasProviderCode;
+      }
+      const providerName = providers
+        .find((p) => p.code === e.providerCode)
+        ?.name?.toUpperCase();
+      return providerName === CIERRE_FONDO_VENTAS_PROVIDER_NAME;
+    };
+
+    const matches = fondoEntries.filter(isVentas);
+    if (matches.length === 0) return null;
+
+    const toMs = (iso: unknown) => {
+      try {
+        const ms = new Date(String(iso || "")).getTime();
+        return Number.isFinite(ms) ? ms : 0;
+      } catch {
+        return 0;
+      }
+    };
+
+    let best = matches[0];
+    let bestMs = toMs(best.createdAt);
+    for (let i = 1; i < matches.length; i++) {
+      const cur = matches[i];
+      const curMs = toMs(cur.createdAt);
+      if (curMs > bestMs) {
+        best = cur;
+        bestMs = curMs;
+        continue;
+      }
+      if (
+        curMs === bestMs &&
+        String(cur.id).localeCompare(String(best.id)) > 0
+      ) {
+        best = cur;
+        bestMs = curMs;
+      }
+    }
+    return best?.id || null;
+  }, [fondoEntries, providers, cierreFondoVentasProviderCode]);
+
+  const isCierreFondoVentasMovement = useCallback(
+    (entry: FondoEntry): boolean => {
+      try {
+        if (cierreFondoVentasProviderCode) {
+          return entry.providerCode === cierreFondoVentasProviderCode;
+        }
+        const providerName = providers
+          .find((p) => p.code === entry.providerCode)
+          ?.name?.toUpperCase();
+        return providerName === CIERRE_FONDO_VENTAS_PROVIDER_NAME;
+      } catch {
+        return false;
+      }
+    },
+    [providers, cierreFondoVentasProviderCode],
+  );
+
   const handleDeleteMovement = useCallback(
     (entry: FondoEntry) => {
+      // Restricción: solo se permite borrar el ÚLTIMO "CIERRE FONDO VENTAS".
+      if (isCierreFondoVentasMovement(entry)) {
+        if (
+          !latestCierreFondoVentasMovementId ||
+          entry.id !== latestCierreFondoVentasMovementId
+        ) {
+          showToast(
+            "Solo se permite eliminar el último cierre de Fondo Ventas.",
+            "warning",
+            6000,
+          );
+          return;
+        }
+      }
+
+      // Default: only principal admin can delete movements.
+      // Exception: superadmin can delete only "CIERRE FONDO VENTAS" movements.
       if (!isPrincipalAdmin) {
-        showToast(
-          "Solo el administrador principal puede eliminar movimientos",
-          "error"
-        );
-        return;
+        const canSuperDeleteVentas =
+          Boolean(isSuperAdminUser) && isCierreFondoVentasMovement(entry);
+        if (!canSuperDeleteVentas) {
+          showToast(
+            "Solo el administrador principal puede eliminar movimientos",
+            "error",
+          );
+          return;
+        }
       }
 
       if (isMovementLocked(entry)) {
         showToast(
           "Este movimiento está bloqueado (anterior al último cierre) y no puede eliminarse.",
-          "error"
+          "error",
         );
         return;
       }
@@ -5296,7 +6701,14 @@ export function FondoSection({
 
       setConfirmDeleteEntry({ open: true, entry });
     },
-    [isPrincipalAdmin, isMovementLocked, showToast]
+    [
+      isPrincipalAdmin,
+      isSuperAdminUser,
+      isCierreFondoVentasMovement,
+      latestCierreFondoVentasMovementId,
+      isMovementLocked,
+      showToast,
+    ],
   );
 
   const confirmDeleteMovement = useCallback(async () => {
@@ -5307,6 +6719,37 @@ export function FondoSection({
     setIsSaving(true);
 
     try {
+      // Restricción: solo se permite borrar el ÚLTIMO "CIERRE FONDO VENTAS".
+      if (isCierreFondoVentasMovement(entry)) {
+        if (
+          !latestCierreFondoVentasMovementId ||
+          entry.id !== latestCierreFondoVentasMovementId
+        ) {
+          showToast(
+            "Solo se permite eliminar el último cierre de Fondo Ventas.",
+            "warning",
+            6000,
+          );
+          setConfirmDeleteEntry({ open: false, entry: null });
+          return;
+        }
+      }
+
+      // Permission guard (in case state was manipulated).
+      if (!isPrincipalAdmin) {
+        const canSuperDeleteVentas =
+          Boolean(isSuperAdminUser) && isCierreFondoVentasMovement(entry);
+        if (!canSuperDeleteVentas) {
+          showToast(
+            "No autorizado para eliminar este movimiento",
+            "error",
+            5000,
+          );
+          setConfirmDeleteEntry({ open: false, entry: null });
+          return;
+        }
+      }
+
       // Preparar la lista actualizada SIN el movimiento a eliminar
       const updatedEntries = fondoEntries.filter((e) => e.id !== entry.id);
 
@@ -5320,13 +6763,46 @@ export function FondoSection({
         showToast(
           "Error al eliminar el movimiento. Por favor, intente de nuevo.",
           "error",
-          5000
+          5000,
         );
         return; // NO actualizar la UI si falló el guardado
       }
 
+      // If deleting a "CIERRE FONDO VENTAS" movement, reset lock/cooldowns so it can be recreated immediately.
+      try {
+        const normalizedCompany = (company || "").trim();
+        const providerName = providers
+          .find((p) => p.code === entry.providerCode)
+          ?.name?.toUpperCase();
+        const isCierreVentas =
+          providerName === CIERRE_FONDO_VENTAS_PROVIDER_NAME;
+        if (normalizedCompany.length > 0 && isCierreVentas) {
+          await forceClearClosingGuards(
+            normalizedCompany,
+            "delete_cierre_fondo_ventas",
+          );
+
+          lastDailyClosingSavedAtRef.current = 0;
+          lastMovementCreatedAtRef.current = 0;
+          lastMovementDedupeRef.current = null;
+          if (typeof window !== "undefined") {
+            const dailyKey = `fondogeneral-lastDailyClosingSavedAt:${normalizedCompany}`;
+            const createdKey = `fondogeneral-lastMovementCreatedAt:${normalizedCompany}:${accountKey}`;
+            const dedupeKey = `fondogeneral-lastMovementDedupe:${normalizedCompany}:${accountKey}`;
+            localStorage.removeItem(dailyKey);
+            localStorage.removeItem(createdKey);
+            localStorage.removeItem(dedupeKey);
+          }
+        }
+      } catch {
+        // ignore
+      }
+
       // Solo actualizar la UI si el guardado fue exitoso
       setFondoEntries(updatedEntries);
+      if (saved.ledgerSnapshot) {
+        setLedgerSnapshot(saved.ledgerSnapshot);
+      }
 
       // Close modal
       setConfirmDeleteEntry({ open: false, entry: null });
@@ -5337,7 +6813,7 @@ export function FondoSection({
         showToast(
           "Eliminación guardada localmente; pendiente de sincronización (revisa tu conexión).",
           "warning",
-          6000
+          6000,
         );
       }
     } finally {
@@ -5347,8 +6823,18 @@ export function FondoSection({
     confirmDeleteEntry,
     showToast,
     fondoEntries,
+    isPrincipalAdmin,
+    isSuperAdminUser,
+    isCierreFondoVentasMovement,
+    latestCierreFondoVentasMovementId,
+    setConfirmDeleteEntry,
+    company,
+    providers,
+    accountKey,
+    forceClearClosingGuards,
     isSaving,
     persistMovementToFirestore,
+    setLedgerSnapshot,
   ]);
 
   const cancelDeleteMovement = useCallback(() => {
@@ -5366,7 +6852,7 @@ export function FondoSection({
     if (!originalEntry) return false;
     // Verificar si el proveedor ORIGINAL del movimiento es CIERRE FONDO VENTAS
     const originalProvider = providers.find(
-      (p) => p.code === originalEntry.providerCode
+      (p) => p.code === originalEntry.providerCode,
     );
     return (
       originalProvider?.name?.toUpperCase() ===
@@ -5429,7 +6915,8 @@ export function FondoSection({
     const orderedDesc = [...fondoEntries]
       .filter((e) => ((e.currency as any) || "CRC") === "CRC")
       .sort((a, b) => {
-        const diff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        const diff =
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
         if (diff !== 0) return diff;
         return String(b.id).localeCompare(String(a.id));
       });
@@ -5447,7 +6934,8 @@ export function FondoSection({
     const orderedDesc = [...fondoEntries]
       .filter((e) => ((e.currency as any) || "CRC") === "USD")
       .sort((a, b) => {
-        const diff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        const diff =
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
         if (diff !== 0) return diff;
         return String(b.id).localeCompare(String(a.id));
       });
@@ -5493,12 +6981,12 @@ export function FondoSection({
       try {
         const baseStorage = storageSnapshotRef.current
           ? MovimientosFondosService.ensureMovementStorageShape<FondoEntry>(
-            storageSnapshotRef.current,
-            normalizedCompany
-          )
+              storageSnapshotRef.current,
+              normalizedCompany,
+            )
           : MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
-            normalizedCompany
-          );
+              normalizedCompany,
+            );
         baseStorage.company = normalizedCompany;
         // V2: movements are stored in a subcollection. Never persist movements array to main doc.
         baseStorage.operations = { movements: [] };
@@ -5506,7 +6994,7 @@ export function FondoSection({
         const stateSnapshot =
           baseStorage.state ??
           MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
-            normalizedCompany
+            normalizedCompany,
           ).state;
         const parsedInitialCRC = Number(normalizedInitialCRC) || 0;
         const parsedInitialUSD = Number(normalizedInitialUSD) || 0;
@@ -5518,20 +7006,20 @@ export function FondoSection({
 
         const existingCRC = stateSnapshot.balancesByAccount.find(
           (balance) =>
-            balance.accountId === accountKey && balance.currency === "CRC"
+            balance.accountId === accountKey && balance.currency === "CRC",
         );
         const existingUSD = stateSnapshot.balancesByAccount.find(
           (balance) =>
-            balance.accountId === accountKey && balance.currency === "USD"
+            balance.accountId === accountKey && balance.currency === "USD",
         );
 
         const prevInitialCRC = parseBalance(existingCRC?.initialBalance ?? 0);
         const prevInitialUSD = parseBalance(existingUSD?.initialBalance ?? 0);
         const prevCurrentCRC = parseBalance(
-          existingCRC?.currentBalance ?? prevInitialCRC
+          existingCRC?.currentBalance ?? prevInitialCRC,
         );
         const prevCurrentUSD = parseBalance(
-          existingUSD?.currentBalance ?? prevInitialUSD
+          existingUSD?.currentBalance ?? prevInitialUSD,
         );
 
         // Cambiar initialBalance ajusta currentBalance por el mismo delta.
@@ -5573,7 +7061,7 @@ export function FondoSection({
         }
 
         const nextAccountBalances = stateSnapshot.balancesByAccount.filter(
-          (balance) => balance.accountId !== accountKey
+          (balance) => balance.accountId !== accountKey,
         );
         nextAccountBalances.push(nextCRC, nextUSD);
         stateSnapshot.balancesByAccount = nextAccountBalances;
@@ -5599,7 +7087,7 @@ export function FondoSection({
         } catch (storageError) {
           console.warn(
             "[FG-V2] localStorage snapshot write failed:",
-            storageError
+            storageError,
           );
         }
 
@@ -5609,7 +7097,7 @@ export function FondoSection({
         if (resolvedOwnerId) {
           const legacyOwnerKey =
             MovimientosFondosService.buildLegacyOwnerMovementsKey(
-              resolvedOwnerId
+              resolvedOwnerId,
             );
           if (legacyOwnerKey !== companyKey) {
             localStorage.removeItem(legacyOwnerKey);
@@ -5627,7 +7115,7 @@ export function FondoSection({
       try {
         await MovimientosFondosService.saveDocument(
           companyKey,
-          storageToPersist
+          storageToPersist,
         );
       } catch (err) {
         console.error("Error storing fondo entries to Firestore:", err);
@@ -5666,7 +7154,7 @@ export function FondoSection({
         minimumFractionDigits: 0,
         maximumFractionDigits: 0,
       }),
-    []
+    [],
   );
   const amountFormatterUSD = useMemo(
     () =>
@@ -5674,11 +7162,11 @@ export function FondoSection({
         minimumFractionDigits: 0,
         maximumFractionDigits: 0,
       }),
-    []
+    [],
   );
   const dailyClosingDateFormatter = useMemo(
     () => new Intl.DateTimeFormat("es-CR", { dateStyle: "long" }),
-    []
+    [],
   );
   const dateTimeFormatter = useMemo(
     () =>
@@ -5686,7 +7174,7 @@ export function FondoSection({
         dateStyle: "short",
         timeStyle: "short",
       }),
-    []
+    [],
   );
   const formatByCurrency = (currency: "CRC" | "USD", value: number) =>
     currency === "USD"
@@ -5706,47 +7194,96 @@ export function FondoSection({
 
   const buildBreakdownLines = (
     currency: "CRC" | "USD",
-    breakdown?: Record<number, number>
+    breakdown?: Record<number, number>,
   ) => {
     if (!breakdown) return [] as string[];
     return Object.entries(breakdown)
       .filter(([, count]) => count > 0)
       .map(
         ([denomination, count]) =>
-          `${count} x ${formatByCurrency(currency, Number(denomination))}`
+          `${count} x ${formatByCurrency(currency, Number(denomination))}`,
       );
   };
 
   const amountClass = (
     isActive: boolean,
     inputHasValue: boolean,
-    isValid: boolean
+    isValid: boolean,
   ) => {
     if (!isActive) return "border-[var(--input-border)]";
     if (inputHasValue && !isValid) return "border-red-500";
     return "border-[var(--input-border)]";
   };
 
+  const getTodayInvoiceDDMM = (date: Date = new Date()) => {
+    const dd = String(date.getDate()).padStart(2, "0");
+    const mm = String(date.getMonth() + 1).padStart(2, "0");
+    return `${dd}${mm}`;
+  };
+
+  const selectedProviderData = useMemo(() => {
+    if (!selectedProvider) return null;
+    return providers.find((p) => p.code === selectedProvider) ?? null;
+  }, [providers, selectedProvider]);
+
+  const isInvoiceAutoDateLocked = useMemo(() => {
+    if (!selectedProvider) return false;
+    if (isAutoAdjustmentProvider(selectedProvider)) return true;
+    if (selectedProvider.toUpperCase() === CIERRE_FONDO_VENTAS_PROVIDER_NAME)
+      return true;
+    return (
+      selectedProviderData?.name?.toUpperCase() ===
+      CIERRE_FONDO_VENTAS_PROVIDER_NAME
+    );
+  }, [selectedProvider, selectedProviderData]);
+
+  // Si el proveedor es un cierre/ajuste automático, usar DDMM como N° factura y bloquear edición.
+  useEffect(() => {
+    if (!isInvoiceAutoDateLocked) return;
+    // Al editar un movimiento existente, no sobrescribir el N° factura guardado.
+    if (editingEntryId) return;
+    const today = getTodayInvoiceDDMM();
+    if (invoiceNumber !== today) {
+      setInvoiceNumber(today);
+      setInvoiceError("");
+    }
+  }, [isInvoiceAutoDateLocked, editingEntryId, invoiceNumber]);
+
   const handleProviderChange = (value: string) => {
     setSelectedProvider(value);
     setProviderError(""); // Clear error when user starts typing
     const oldPaymentType = paymentType;
+    let nextPaymentType: FondoEntry["paymentType"] = "COMPRA INVENTARIO";
+    let shouldAutoDateInvoice = false;
     try {
       const prov = providers.find((p) => p.code === value);
+      shouldAutoDateInvoice =
+        isAutoAdjustmentProvider(value) ||
+        prov?.name?.toUpperCase() === CIERRE_FONDO_VENTAS_PROVIDER_NAME;
       if (prov && prov.type && isFondoMovementType(prov.type)) {
-        setPaymentType(prov.type as FondoEntry["paymentType"]);
+        nextPaymentType = prov.type as FondoEntry["paymentType"];
+        setPaymentType(nextPaymentType);
       } else {
         // fallback to default when provider has no type or it's invalid
-        setPaymentType("COMPRA INVENTARIO");
+        nextPaymentType = "COMPRA INVENTARIO";
+        setPaymentType(nextPaymentType);
       }
     } catch {
       // defensive: ensure UI remains usable on unexpected provider shapes
-      setPaymentType("COMPRA INVENTARIO");
+      nextPaymentType = "COMPRA INVENTARIO";
+      setPaymentType(nextPaymentType);
     }
+
+    if (shouldAutoDateInvoice) {
+      setInvoiceNumber(getTodayInvoiceDDMM());
+      setInvoiceError("");
+    }
+
     // Move amount between egreso and ingreso fields if type changes
     const oldIsEgreso =
       isEgresoType(oldPaymentType) || isGastoType(oldPaymentType);
-    const newIsEgreso = isEgresoType(paymentType) || isGastoType(paymentType);
+    const newIsEgreso =
+      isEgresoType(nextPaymentType) || isGastoType(nextPaymentType);
     if (oldIsEgreso && !newIsEgreso && egreso.trim()) {
       setIngreso(egreso);
       setEgreso("");
@@ -5756,6 +7293,7 @@ export function FondoSection({
     }
   };
   const handleInvoiceNumberChange = (value: string) => {
+    if (isInvoiceAutoDateLocked) return;
     setInvoiceNumber(value.replace(/\D/g, "").slice(0, 4));
     setInvoiceError(""); // Clear error when user starts typing
   };
@@ -5774,18 +7312,26 @@ export function FondoSection({
     setManagerError(""); // Clear error when user starts typing
   };
 
+  const managerOptionsLoading = Boolean(isSuperAdminUser && editingEntryId)
+    ? superAdminUsersLoading
+    : employeesLoading;
+
   const managerSelectDisabled =
-    !company || employeesLoading || employeeOptions.length === 0;
-  const invoiceDisabled = !company;
+    !company ||
+    managerOptionsLoading ||
+    employeeOptions.length === 0 ||
+    // Superadmin: manager is auto-assigned when creating.
+    (Boolean(isSuperAdminUser) && !editingEntryId);
+  const invoiceDisabled = !company || isInvoiceAutoDateLocked;
   const egresoBorderClass = amountClass(
     isEgreso,
     egreso.trim().length > 0,
-    egresoValid
+    egresoValid,
   );
   const ingresoBorderClass = amountClass(
     isIngreso,
     ingreso.trim().length > 0,
-    ingresoValid
+    ingresoValid,
   );
 
   const closeMovementModal = () => {
@@ -5830,6 +7376,13 @@ export function FondoSection({
       return;
     }
 
+    // Si hubo un cierre pendiente (guardado en localStorage), solicitar confirmación de conteo físico.
+    if (shouldPromptPhysicalCount()) {
+      setPhysicalCountWasDone(false);
+      setConfirmPhysicalCountOpen(true);
+      return;
+    }
+
     openCreateMovementDrawer();
   };
 
@@ -5847,7 +7400,7 @@ export function FondoSection({
       })
       .sort(
         (a, b) =>
-          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
       )[0];
 
     const initialValues: DailyClosingFormValues = {
@@ -5869,6 +7422,31 @@ export function FondoSection({
     setEditingDailyClosingId(null);
     setDailyClosingInitialValues(null);
   };
+
+  const handleCancelPhysicalCount = useCallback(() => {
+    setConfirmPhysicalCountOpen(false);
+  }, []);
+
+  const handleConfirmPhysicalCount = useCallback(() => {
+    setConfirmPhysicalCountOpen(false);
+    // Marcar como confirmado inmediatamente para no volver a solicitar el conteo
+    // aunque el usuario cierre el formulario sin guardar un movimiento.
+    if (typeof window !== "undefined" && accountKey === "FondoGeneral") {
+      try {
+        const key = buildPhysicalCountStorageKey();
+        if (key) localStorage.setItem(key, "false");
+        cleanupPhysicalCountLegacyKeys();
+      } catch {
+        // ignore
+      }
+    }
+    openCreateMovementDrawer();
+  }, [
+    openCreateMovementDrawer,
+    accountKey,
+    buildPhysicalCountStorageKey,
+    cleanupPhysicalCountLegacyKeys,
+  ]);
 
   const handleConfirmDailyClosing = async (closing: DailyClosingFormValues) => {
     if (accountKey !== "FondoGeneral") {
@@ -5901,8 +7479,8 @@ export function FondoSection({
     const record: DailyClosingRecord = {
       id: editingDailyClosingId ?? `${Date.now()}`,
       createdAt: editingDailyClosingId
-        ? dailyClosings.find((d) => d.id === editingDailyClosingId)
-          ?.createdAt ?? createdAt
+        ? (dailyClosings.find((d) => d.id === editingDailyClosingId)
+            ?.createdAt ?? createdAt)
         : createdAt,
       closingDate: closingDateValue.toISOString(),
       manager: managerName,
@@ -5924,17 +7502,137 @@ export function FondoSection({
       return;
     }
 
+    // Cross-device/tabs guard: prevent Fondo General closing while another closing is being created.
+    // Enforced only for regular users (edits are allowed).
+    let closingGuard: { token: string; docId: string } | null = null;
+    try {
+      const isEditingClosing = Boolean(editingDailyClosingId);
+      // Enforce guard ONLY for regular users.
+      // Admin/superadmin are allowed to create a closing even during the lock window.
+      if (!isEditingClosing && isRegularUser) {
+        const acquired = await acquireClosingGuard(
+          normalizedCompany,
+          "FONDO_GENERAL",
+        );
+        if (!acquired.ok) {
+          const kindLabel =
+            acquired.lockedKind === "FONDO_GENERAL"
+              ? "Fondo General"
+              : acquired.lockedKind === "FONDO_VENTAS"
+                ? "Fondo Ventas"
+                : "otro cierre";
+          showToast(
+            `Otro cierre (${kindLabel}) se está registrando. Intente en ${formatToastWaitTime(
+              acquired.remainingSec,
+            )}.`,
+            "warning",
+            6000,
+          );
+          return;
+        }
+        closingGuard = { token: acquired.token, docId: acquired.docId };
+      }
+    } catch {
+      // ignore; fall back to client-side cooldown
+    }
+
+    // Prevent duplicate daily closings created almost instantly.
+    // Requirement: enforce at least 1 minute between NEW closings for role "user" (edits are allowed).
+    const isEditingClosing = Boolean(editingDailyClosingId);
+    const dailyClosingCooldownKey = `fondogeneral-lastDailyClosingSavedAt:${normalizedCompany}`;
+    if (!isEditingClosing) {
+      if (
+        dailyClosingSubmitInProgressRef.current ||
+        dailyClosingsRequestCountRef.current > 0
+      ) {
+        showToast(
+          "Ya hay un cierre guardándose. Espere un momento.",
+          "warning",
+          4000,
+        );
+        return;
+      }
+
+      const nowMs = Date.now();
+      let lastSavedAtMs = lastDailyClosingSavedAtRef.current;
+      if (typeof window !== "undefined") {
+        try {
+          const stored = Number(localStorage.getItem(dailyClosingCooldownKey));
+          if (Number.isFinite(stored) && stored > 0) {
+            lastSavedAtMs = Math.max(lastSavedAtMs, stored);
+          }
+        } catch {
+          // ignore storage errors
+        }
+      }
+
+      // Cooldown between NEW closings only for regular users.
+      if (isRegularUser) {
+        if (
+          lastSavedAtMs > 0 &&
+          nowMs - lastSavedAtMs < DAILY_CLOSING_MIN_INTERVAL_MS
+        ) {
+          const remainingMs =
+            DAILY_CLOSING_MIN_INTERVAL_MS - (nowMs - lastSavedAtMs);
+          const remainingSec = Math.ceil(remainingMs / 1000);
+          showToast(
+            `Ya se registró un cierre hace poco. Espere ${formatToastWaitTime(
+              remainingSec,
+            )} para crear otro.`,
+            "warning",
+            5000,
+          );
+          return;
+        }
+      }
+
+      // Lock immediately to avoid double-click / double-submit duplicates.
+      dailyClosingSubmitInProgressRef.current = true;
+    }
+
     // Save to Firestore first and wait for confirmation
     beginDailyClosingsRequest();
     try {
       await DailyClosingsService.saveClosing(normalizedCompany, record);
-      console.log(`[CIERRE] ✅ Cierre guardado exitosamente en Firestore. ID: ${record.id}, Fecha: ${record.closingDate}`);
-      
+      console.log(
+        `[CIERRE] ✅ Cierre guardado exitosamente en Firestore. ID: ${record.id}, Fecha: ${record.closingDate}`,
+      );
+
+      // If an admin/superadmin created a NEW closing, touch the guard on success so regular users
+      // are blocked for the lock window.
+      if (!isEditingClosing && !isRegularUser) {
+        void touchClosingGuard(normalizedCompany, "FONDO_GENERAL");
+      }
+
+      // Mark cooldown only after a successful save (so retries after errors are allowed).
+      if (!isEditingClosing) {
+        const savedAt = Date.now();
+        lastDailyClosingSavedAtRef.current = savedAt;
+        if (typeof window !== "undefined") {
+          try {
+            localStorage.setItem(dailyClosingCooldownKey, String(savedAt));
+          } catch {
+            // ignore storage errors
+          }
+        }
+      }
+
       // Only update local state after successful save
       setDailyClosings((prev) => mergeDailyClosingRecords(prev, [record]));
       loadedDailyClosingKeysRef.current.add(closingDateKey);
       loadingDailyClosingKeysRef.current.delete(closingDateKey);
       setDailyClosingsHydrated(true);
+
+      // Guardar en localStorage el último cierre (para pedir confirmación en el primer movimiento después del cierre)
+      if (typeof window !== "undefined") {
+        try {
+          const key = buildPhysicalCountStorageKey();
+          if (key) localStorage.setItem(key, "true");
+          cleanupPhysicalCountLegacyKeys();
+        } catch {
+          // ignore storage errors
+        }
+      }
 
       setPendingCierreDeCaja(false);
       setDailyClosingModalOpen(false);
@@ -5944,7 +7642,8 @@ export function FondoSection({
       // Alert email for save failures (non-blocking)
       try {
         const whenISO = new Date().toISOString();
-        const where = "FondoSection.handleConfirmDailyClosing -> DailyClosingsService.saveClosing";
+        const where =
+          "FondoSection.handleConfirmDailyClosing -> DailyClosingsService.saveClosing";
         const errorMessage =
           err instanceof Error
             ? `${err.name}: ${err.message}${err.stack ? `\n\nStack:\n${err.stack}` : ""}`
@@ -5964,7 +7663,10 @@ export function FondoSection({
           `Error: ${errorMessage}`,
         ].join("\n");
 
-        const recipients = ["chavesa698@gmail.com", "price.master.srl@gmail.com"];
+        const recipients = [
+          "chavesa698@gmail.com",
+          "price.master.srl@gmail.com",
+        ];
         void Promise.all(
           recipients.map((to) =>
             addDoc(collection(db, "mail"), {
@@ -5972,10 +7674,13 @@ export function FondoSection({
               subject,
               text,
               createdAt: serverTimestamp(),
-            })
-          )
+            }),
+          ),
         ).catch((mailErr) => {
-          console.error("[CIERRE] ❌ Error encolando email de alerta:", mailErr);
+          console.error(
+            "[CIERRE] ❌ Error encolando email de alerta:",
+            mailErr,
+          );
         });
       } catch (mailErr) {
         console.error("[CIERRE] ❌ Error preparando email de alerta:", mailErr);
@@ -5984,12 +7689,28 @@ export function FondoSection({
       showToast(
         "Error al guardar el cierre. Por favor, intente de nuevo.",
         "error",
-        5000
+        5000,
       );
+
+      // Release cross-device guard on failure so users can retry immediately.
+      if (closingGuard) {
+        try {
+          void releaseClosingGuard(normalizedCompany, closingGuard);
+        } catch {
+          // ignore
+        }
+        closingGuard = null;
+      }
       return;
     } finally {
       finishDailyClosingsRequest();
+      if (!isEditingClosing) {
+        dailyClosingSubmitInProgressRef.current = false;
+      }
     }
+
+    // IMPORTANT: Do NOT release the cross-device guard on success.
+    // Let it expire (lockedUntilMs) so other devices/tabs can't create a close “almost at the same time”.
 
     const notificationRecipients = new Set<string>();
     const adminRecipient = ownerAdminEmail?.trim();
@@ -6024,7 +7745,7 @@ export function FondoSection({
         {
           ownerId: activeOwnerId,
           company: normalizedCompany,
-        }
+        },
       );
     }
 
@@ -6040,13 +7761,13 @@ export function FondoSection({
           createdAt: serverTimestamp(),
         });
         console.log(
-          `[MAIL-DOC] Documento creado en 'mail' para ${recipient}, ID: ${docRef.id}`
+          `[MAIL-DOC] Documento creado en 'mail' para ${recipient}, ID: ${docRef.id}`,
         );
         showToast("Correo de cierre diario enviado correctamente", "success");
       } catch (err) {
         console.error(
           `[MAIL-DOC] Error creando documento en 'mail' para ${recipient}:`,
-          err
+          err,
         );
         showToast("Error al enviar correo de cierre diario", "error");
       }
@@ -6058,6 +7779,15 @@ export function FondoSection({
     // using the existing edit flow which marks entries as 'Editado').
     try {
       const newMovements: FondoEntry[] = [];
+      let latestLedgerSnapshot: {
+        initialCRC: number;
+        currentCRC: number;
+        initialUSD: number;
+        currentUSD: number;
+      } | null = null;
+
+      const closingBalanceCRC = Math.trunc(record.totalCRC ?? 0);
+      const closingBalanceUSD = Math.trunc(record.totalUSD ?? 0);
 
       const buildCierreMovementBaseId = (when: Date) => {
         // Local time, URL-safe: 2025_12_15-02_10_38_929_CIERRE
@@ -6088,10 +7818,14 @@ export function FondoSection({
             isAutoAdjustmentProvider(e.providerCode)
           ) {
             const contrib = (e.amountIngreso || 0) - (e.amountEgreso || 0);
-            if (e.currency === "USD") prevUSDContribution += contrib;
-            else prevCRCContribution += contrib;
+            if ((e.currency as any) === "USD") {
+              prevUSDContribution += contrib;
+            } else {
+              prevCRCContribution += contrib;
+            }
           }
         });
+
         const baseBalanceCRC = currentBalanceCRC - prevCRCContribution;
         const baseBalanceUSD = currentBalanceUSD - prevUSDContribution;
         adjustedDiffCRC =
@@ -6110,7 +7844,7 @@ export function FondoSection({
         } catch (rbErr) {
           console.error(
             "[FG-DEBUG] Error setting recordedBalance on edited closing:",
-            rbErr
+            rbErr,
           );
         }
 
@@ -6135,21 +7869,26 @@ export function FondoSection({
         const paymentType = isPositive
           ? AUTO_ADJUSTMENT_MOVEMENT_TYPE_INGRESO
           : AUTO_ADJUSTMENT_MOVEMENT_TYPE_EGRESO;
+        const invoiceDDMM = getTodayInvoiceDDMM(createdAtDate);
         const entry: FondoEntry = {
           id: cierreBaseId,
           providerCode: AUTO_ADJUSTMENT_PROVIDER_CODE,
-          invoiceNumber: String(Math.abs(diff)).padStart(4, "0"),
+          invoiceNumber: invoiceDDMM,
           paymentType,
           amountEgreso: isPositive ? 0 : Math.abs(diff),
           amountIngreso: isPositive ? diff : 0,
           manager: AUTO_ADJUSTMENT_MANAGER,
-          notes: `AJUSTE APLICADO AL SALDO ACTUAL\n[ALERT_ICON]Diferencia CRC: ${diff >= 0 ? "+ " : "- "
-            }${formatByCurrency("CRC", Math.abs(diff))}.${userNotes ? ` Notas: ${userNotes}` : ""
-            }`,
+          notes: `AJUSTE APLICADO AL SALDO ACTUAL\n[ALERT_ICON]Diferencia CRC: ${
+            diff >= 0 ? "+ " : "- "
+          }${formatByCurrency("CRC", Math.abs(diff))}.${
+            userNotes ? ` Notas: ${userNotes}` : ""
+          }`,
           createdAt,
           accountId: accountKey,
           currency: "CRC",
           breakdown: closing.breakdownCRC ?? {},
+          closingBalanceCRC,
+          closingBalanceUSD,
         } as FondoEntry;
         newMovements.push(entry);
       }
@@ -6160,20 +7899,25 @@ export function FondoSection({
         const paymentType = isPositive
           ? AUTO_ADJUSTMENT_MOVEMENT_TYPE_INGRESO
           : AUTO_ADJUSTMENT_MOVEMENT_TYPE_EGRESO;
+        const invoiceDDMM = getTodayInvoiceDDMM(createdAtDate);
         const entry: FondoEntry = {
           id: plannedCount > 1 ? `${cierreBaseId}_USD` : cierreBaseId,
           providerCode: AUTO_ADJUSTMENT_PROVIDER_CODE,
-          invoiceNumber: String(Math.abs(diff)).padStart(4, "0"),
+          invoiceNumber: invoiceDDMM,
           paymentType,
           amountEgreso: isPositive ? 0 : Math.abs(diff),
           amountIngreso: isPositive ? diff : 0,
           manager: AUTO_ADJUSTMENT_MANAGER,
-          notes: `AJUSTE APLICADO AL SALDO ACTUAL\n[ALERT_ICON]Diferencia USD: ${diff >= 0 ? "+ " : "- "
-            }${formatByCurrency("USD", Math.abs(diff))}.${userNotes ? ` Notas: ${userNotes}` : ""
-            }`,
+          notes: `AJUSTE APLICADO AL SALDO ACTUAL\n[ALERT_ICON]Diferencia USD: ${
+            diff >= 0 ? "+ " : "- "
+          }${formatByCurrency("USD", Math.abs(diff))}.${
+            userNotes ? ` Notas: ${userNotes}` : ""
+          }`,
           createdAt,
           accountId: accountKey,
           currency: "USD",
+          closingBalanceCRC,
+          closingBalanceUSD,
         } as FondoEntry;
         if ((entry as any).currency === "USD")
           (entry as any).breakdown = closing.breakdownUSD ?? {};
@@ -6181,20 +7925,24 @@ export function FondoSection({
       }
 
       if (adjustedDiffCRC === 0 && adjustedDiffUSD === 0) {
+        const invoiceDDMM = getTodayInvoiceDDMM(createdAtDate);
         const entry: FondoEntry = {
           id: cierreBaseId,
           providerCode: AUTO_ADJUSTMENT_PROVIDER_CODE,
-          invoiceNumber: "0000",
+          invoiceNumber: invoiceDDMM,
           paymentType: "INFORMATIVO" as any, // Tipo especial para cierres sin diferencias
           amountEgreso: 0,
           amountIngreso: 0,
           manager: AUTO_ADJUSTMENT_MANAGER,
-          notes: `[CHECK_ICON]Sin diferencias.${userNotes ? ` Notas: ${userNotes}` : ""
-            }`,
+          notes: `[CHECK_ICON]Sin diferencias.${
+            userNotes ? ` Notas: ${userNotes}` : ""
+          }`,
           createdAt,
           accountId: accountKey,
           currency: "CRC",
           breakdown: closing.breakdownCRC ?? {},
+          closingBalanceCRC,
+          closingBalanceUSD,
         } as FondoEntry;
         newMovements.push(entry);
       }
@@ -6203,7 +7951,7 @@ export function FondoSection({
         console.info(
           "[FG-DEBUG] Removing previous adjustment movements for closing",
           record.id,
-          { beforeCount: fondoEntries.length }
+          { beforeCount: fondoEntries.length },
         );
 
         // Persistir eliminación de ajustes para que el currentBalance se revierta.
@@ -6211,18 +7959,25 @@ export function FondoSection({
           const toRemoveNow = fondoEntries.filter(
             (e) =>
               e.originalEntryId === record.id &&
-              isAutoAdjustmentProvider(e.providerCode)
+              isAutoAdjustmentProvider(e.providerCode),
           );
           for (const removed of toRemoveNow) {
-            await persistMovementToFirestore(fondoEntries, "delete", {
-              deleteId: removed.id,
-              before: removed,
-            });
+            const saved = await persistMovementToFirestore(
+              fondoEntries,
+              "delete",
+              {
+                deleteId: removed.id,
+                before: removed,
+              },
+            );
+            if (saved.ok && saved.ledgerSnapshot) {
+              latestLedgerSnapshot = saved.ledgerSnapshot;
+            }
           }
         } catch (persistRemoveErr) {
           console.error(
             "[FG-DEBUG] Error persisting deletion of adjustment movements:",
-            persistRemoveErr
+            persistRemoveErr,
           );
         }
 
@@ -6230,14 +7985,14 @@ export function FondoSection({
           const toRemove = prev.filter(
             (e) =>
               e.originalEntryId === record.id &&
-              isAutoAdjustmentProvider(e.providerCode)
+              isAutoAdjustmentProvider(e.providerCode),
           );
           const filtered = prev.filter(
             (e) =>
               !(
                 e.originalEntryId === record.id &&
                 isAutoAdjustmentProvider(e.providerCode)
-              )
+              ),
           );
           console.info("[FG-DEBUG] After remove, count:", filtered.length);
           if (toRemove.length > 0) {
@@ -6269,20 +8024,24 @@ export function FondoSection({
                     // Fire-and-forget save for adjustment updates (non-critical)
                     void DailyClosingsService.saveClosing(
                       normalizedCompany,
-                      updatedRecord
-                    ).then(() => {
-                      console.log(`[CIERRE] ✅ Ajuste de cierre guardado exitosamente. ID: ${updatedRecord.id}`);
-                    }).catch((saveErr) => {
-                      console.error(
-                        "[CIERRE] ❌ Error saving updated daily closing with resolution:",
-                        saveErr
-                      );
-                    });
+                      updatedRecord,
+                    )
+                      .then(() => {
+                        console.log(
+                          `[CIERRE] ✅ Ajuste de cierre guardado exitosamente. ID: ${updatedRecord.id}`,
+                        );
+                      })
+                      .catch((saveErr) => {
+                        console.error(
+                          "[CIERRE] ❌ Error saving updated daily closing with resolution:",
+                          saveErr,
+                        );
+                      });
                   }
                 } catch (saveErr) {
                   console.error(
                     "[CIERRE] ❌ Error persisting daily closing resolution:",
-                    saveErr
+                    saveErr,
                   );
                 }
                 return updated;
@@ -6290,13 +8049,18 @@ export function FondoSection({
             } catch (err) {
               console.error(
                 "Error preparing adjustment resolution summary:",
-                err
+                err,
               );
             }
           }
 
           return filtered;
         });
+
+        // Aplicar balances junto con la actualización de movimientos para evitar saltos visuales.
+        if (latestLedgerSnapshot) {
+          setLedgerSnapshot(latestLedgerSnapshot);
+        }
       }
 
       if (newMovements.length > 0) {
@@ -6310,15 +8074,15 @@ export function FondoSection({
             value === "USD" ? "USD" : "CRC";
 
           const plannedCurrencies = new Set<MovementCurrencyKey>(
-            newMovements.map((m) => normalizeCurrency(m.currency))
+            newMovements.map((m) => normalizeCurrency(m.currency)),
           );
 
           const existingAdjustments = editingDailyClosingId
             ? fondoEntries.filter(
-              (e) =>
-                e.originalEntryId === record.id &&
-                isAutoAdjustmentProvider(e.providerCode)
-            )
+                (e) =>
+                  e.originalEntryId === record.id &&
+                  isAutoAdjustmentProvider(e.providerCode),
+              )
             : [];
 
           const existingByCurrency = new Map<MovementCurrencyKey, FondoEntry>();
@@ -6331,10 +8095,17 @@ export function FondoSection({
             for (const prevAdj of existingAdjustments) {
               const cur = normalizeCurrency(prevAdj.currency);
               if (!plannedCurrencies.has(cur)) {
-                await persistMovementToFirestore(fondoEntries, "delete", {
-                  deleteId: prevAdj.id,
-                  before: prevAdj,
-                });
+                const saved = await persistMovementToFirestore(
+                  fondoEntries,
+                  "delete",
+                  {
+                    deleteId: prevAdj.id,
+                    before: prevAdj,
+                  },
+                );
+                if (saved.ok && saved.ledgerSnapshot) {
+                  latestLedgerSnapshot = saved.ledgerSnapshot;
+                }
               }
             }
           }
@@ -6359,25 +8130,37 @@ export function FondoSection({
                 accountId: accountKey,
                 currency: cur,
                 originalEntryId: record.id,
+                closingBalanceCRC: movement.closingBalanceCRC,
+                closingBalanceUSD: movement.closingBalanceUSD,
               } as FondoEntry;
 
-              await persistMovementToFirestore(fondoEntries, "edit", {
-                upsert: updatedForPersist,
-                before: existing,
-              });
+              const saved = await persistMovementToFirestore(
+                fondoEntries,
+                "edit",
+                {
+                  upsert: updatedForPersist,
+                  before: existing,
+                },
+              );
+              if (saved.ok && saved.ledgerSnapshot) {
+                latestLedgerSnapshot = saved.ledgerSnapshot;
+              }
             } else {
               // Creating a new adjustment movement
-              await persistMovementToFirestore(
+              const saved = await persistMovementToFirestore(
                 [movement, ...fondoEntries],
                 "create",
-                { upsert: movement }
+                { upsert: movement },
               );
+              if (saved.ok && saved.ledgerSnapshot) {
+                latestLedgerSnapshot = saved.ledgerSnapshot;
+              }
             }
           }
         } catch (persistAdjErr) {
           console.error(
             "[FG-DEBUG] Error persisting daily closing adjustments to main ledger:",
-            persistAdjErr
+            persistAdjErr,
           );
         }
 
@@ -6387,7 +8170,7 @@ export function FondoSection({
             console.info(
               "[FG-DEBUG] Updating existing related adjustment movements for closing",
               record.id,
-              { prevCount: prev.length, newMovements }
+              { prevCount: prev.length, newMovements },
             );
             const updated = prev.map((e) => {
               if (
@@ -6395,7 +8178,7 @@ export function FondoSection({
                 isAutoAdjustmentProvider(e.providerCode)
               ) {
                 const match = newMovements.find(
-                  (nm) => nm.currency === e.currency
+                  (nm) => nm.currency === e.currency,
                 );
                 if (!match) return e;
                 // build audit history
@@ -6438,7 +8221,7 @@ export function FondoSection({
                     manager: AUTO_ADJUSTMENT_MANAGER,
                     notes: match.notes,
                     currency: match.currency,
-                  }
+                  },
                 );
                 const newRecord = {
                   at: new Date().toISOString(),
@@ -6456,6 +8239,8 @@ export function FondoSection({
                   notes: match.notes,
                   createdAt: match.createdAt,
                   manager: AUTO_ADJUSTMENT_MANAGER,
+                  closingBalanceCRC: match.closingBalanceCRC,
+                  closingBalanceUSD: match.closingBalanceUSD,
                   isAudit: true,
                   originalEntryId: e.originalEntryId ?? e.id,
                   auditDetails: JSON.stringify({ history: compressedHistory }),
@@ -6469,7 +8254,7 @@ export function FondoSection({
                 (u) =>
                   u.originalEntryId === record.id &&
                   u.currency === nm.currency &&
-                  isAutoAdjustmentProvider(u.providerCode)
+                  isAutoAdjustmentProvider(u.providerCode),
               );
               if (!exists) {
                 updated.unshift(nm);
@@ -6477,7 +8262,7 @@ export function FondoSection({
             });
             console.info(
               "[FG-DEBUG] Updated fondoEntries count after merge:",
-              updated.length
+              updated.length,
             );
             return updated;
           });
@@ -6485,18 +8270,23 @@ export function FondoSection({
           // Prepend so the most recent movement appears first (consistent with createdAt)
           console.info(
             "[FG-DEBUG] Prepending new adjustment movements",
-            newMovements
+            newMovements,
           );
           setFondoEntries((prev) => {
             const next = [...newMovements, ...prev];
             console.info(
               "[FG-DEBUG] fondoEntries count after prepend:",
-              next.length
+              next.length,
             );
             return next;
           });
 
           // Persistencia: ya se hizo vía persistMovementToFirestore (incluye subcolección v2 + documento principal)
+        }
+
+        // Aplicar balances junto con la actualización de movimientos para evitar saltos visuales.
+        if (latestLedgerSnapshot) {
+          setLedgerSnapshot(latestLedgerSnapshot);
         }
 
         // Build a human-readable summary of the adjustments we just applied
@@ -6506,7 +8296,7 @@ export function FondoSection({
             const sign = amt >= 0 ? "+" : "-";
             return `${m.currency} ${sign} ${formatByCurrency(
               m.currency as "CRC" | "USD",
-              Math.abs(amt)
+              Math.abs(amt),
             )}`;
           });
           const note = `Ajustes aplicados: ${addedParts.join(" / ")}`;
@@ -6518,7 +8308,7 @@ export function FondoSection({
               (m.currency === "CRC"
                 ? (m.amountIngreso || 0) - (m.amountEgreso || 0)
                 : 0),
-            0
+            0,
           );
           const totalNewUSD = newMovements.reduce(
             (s, m) =>
@@ -6526,7 +8316,7 @@ export function FondoSection({
               (m.currency === "USD"
                 ? (m.amountIngreso || 0) - (m.amountEgreso || 0)
                 : 0),
-            0
+            0,
           );
 
           // compute existing previous contribution linked to this closing (before we mutate fondoEntries)
@@ -6534,29 +8324,29 @@ export function FondoSection({
             (s, e) =>
               s +
               (e.originalEntryId === record.id &&
-                isAutoAdjustmentProvider(e.providerCode) &&
-                e.currency === "CRC"
+              isAutoAdjustmentProvider(e.providerCode) &&
+              e.currency === "CRC"
                 ? (e.amountIngreso || 0) - (e.amountEgreso || 0)
                 : 0),
-            0
+            0,
           );
           const prevUSDContributionExisting = fondoEntries.reduce(
             (s, e) =>
               s +
               (e.originalEntryId === record.id &&
-                isAutoAdjustmentProvider(e.providerCode) &&
-                e.currency === "USD"
+              isAutoAdjustmentProvider(e.providerCode) &&
+              e.currency === "USD"
                 ? (e.amountIngreso || 0) - (e.amountEgreso || 0)
                 : 0),
-            0
+            0,
           );
 
           // New recorded balance = currentBalance (which includes existing adjustments) - prevExisting + newAdded
           const postAdjustmentBalanceCRC = Math.trunc(
-            currentBalanceCRC - prevCRCContributionExisting + totalNewCRC
+            currentBalanceCRC - prevCRCContributionExisting + totalNewCRC,
           );
           const postAdjustmentBalanceUSD = Math.trunc(
-            currentBalanceUSD - prevUSDContributionExisting + totalNewUSD
+            currentBalanceUSD - prevUSDContributionExisting + totalNewUSD,
           );
           const hasCRCAdjustments =
             totalNewCRC !== 0 || prevCRCContributionExisting !== 0;
@@ -6569,17 +8359,17 @@ export function FondoSection({
               if (d.id !== record.id) return d;
               const existingResolution = d.adjustmentResolution || {};
               const updatedResolution: DailyClosingRecord["adjustmentResolution"] =
-              {
-                ...(existingResolution.removedAdjustments
-                  ? {
-                    removedAdjustments:
-                      existingResolution.removedAdjustments,
-                  }
-                  : {}),
-                note,
-                ...(hasCRCAdjustments ? { postAdjustmentBalanceCRC } : {}),
-                ...(hasUSDAdjustments ? { postAdjustmentBalanceUSD } : {}),
-              };
+                {
+                  ...(existingResolution.removedAdjustments
+                    ? {
+                        removedAdjustments:
+                          existingResolution.removedAdjustments,
+                      }
+                    : {}),
+                  note,
+                  ...(hasCRCAdjustments ? { postAdjustmentBalanceCRC } : {}),
+                  ...(hasUSDAdjustments ? { postAdjustmentBalanceUSD } : {}),
+                };
               return {
                 ...d,
                 adjustmentResolution: updatedResolution,
@@ -6592,20 +8382,24 @@ export function FondoSection({
                 // Fire-and-forget save for adjustment notes (non-critical)
                 void DailyClosingsService.saveClosing(
                   normalizedCompany,
-                  updatedRecord
-                ).then(() => {
-                  console.log(`[CIERRE] ✅ Nota de ajuste guardada exitosamente. ID: ${updatedRecord.id}`);
-                }).catch((saveErr) => {
-                  console.error(
-                    "[CIERRE] ❌ Error saving daily closing with adjustment note:",
-                    saveErr
-                  );
-                });
+                  updatedRecord,
+                )
+                  .then(() => {
+                    console.log(
+                      `[CIERRE] ✅ Nota de ajuste guardada exitosamente. ID: ${updatedRecord.id}`,
+                    );
+                  })
+                  .catch((saveErr) => {
+                    console.error(
+                      "[CIERRE] ❌ Error saving daily closing with adjustment note:",
+                      saveErr,
+                    );
+                  });
               }
             } catch (saveErr) {
               console.error(
                 "[CIERRE] ❌ Error persisting daily closing adjustment note:",
-                saveErr
+                saveErr,
               );
             }
 
@@ -6618,7 +8412,7 @@ export function FondoSection({
     } catch (err) {
       console.error(
         "Error creating movement(s) for daily closing difference:",
-        err
+        err,
       );
     }
 
@@ -6656,7 +8450,7 @@ export function FondoSection({
       if (!storageSnapshotRef.current.state) {
         storageSnapshotRef.current.state =
           MovimientosFondosService.createEmptyMovementStorage<FondoEntry>(
-            company
+            company,
           ).state;
       }
       // Bloquear hasta la fecha de creación del cierre
@@ -6671,21 +8465,23 @@ export function FondoSection({
           // Actualizar localStorage
           localStorage.setItem(
             companyKey,
-            JSON.stringify(storageSnapshotRef.current)
+            JSON.stringify(storageSnapshotRef.current),
           );
 
           // Actualizar Firestore
           void MovimientosFondosService.saveDocument(
             companyKey,
-            storageSnapshotRef.current
+            storageSnapshotRef.current,
           )
             .then(() =>
-              console.log("[LOCK-DEBUG] Force saved to Firestore after closing")
+              console.log(
+                "[LOCK-DEBUG] Force saved to Firestore after closing",
+              ),
             )
             .catch((err) => {
               console.error(
                 "Error force saving lockedUntil to Firestore:",
-                err
+                err,
               );
             });
         } catch (err) {
@@ -6713,7 +8509,7 @@ export function FondoSection({
             newValue: value,
             oldValue: previousValue,
             storageArea: localStorage,
-          })
+          }),
         );
       } catch (error) {
         console.error("Error saving selected company to localStorage:", error);
@@ -6744,7 +8540,7 @@ export function FondoSection({
             ? "all"
             : mode === "ingreso"
               ? FONDO_INGRESO_TYPES[0]
-              : FONDO_EGRESO_TYPES[0]
+              : FONDO_EGRESO_TYPES[0],
         );
         setFilterEditedOnly(false);
         setSearchQuery("");
@@ -6760,7 +8556,7 @@ export function FondoSection({
       resetFondoForm,
       adminCompany,
       keepFiltersAcrossCompanies,
-    ]
+    ],
   );
 
   // Escuchar cambios de empresa desde ProviderSection (sincronización bidireccional)
@@ -6801,7 +8597,7 @@ export function FondoSection({
               ? "all"
               : mode === "ingreso"
                 ? FONDO_INGRESO_TYPES[0]
-                : FONDO_EGRESO_TYPES[0]
+                : FONDO_EGRESO_TYPES[0],
           );
           setFilterEditedOnly(false);
           setSearchQuery("");
@@ -6824,7 +8620,7 @@ export function FondoSection({
   ]);
 
   const handleFondoKeyDown = (
-    event: React.KeyboardEvent<HTMLInputElement | HTMLSelectElement>
+    event: React.KeyboardEvent<HTMLInputElement | HTMLSelectElement>,
   ) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -6834,7 +8630,7 @@ export function FondoSection({
 
   const displayedEntries = useMemo(
     () => (sortAsc ? [...fondoEntries].slice().reverse() : fondoEntries),
-    [fondoEntries, sortAsc]
+    [fondoEntries, sortAsc],
   );
 
   // days that have at least one movement (used to enable/disable dates in the calendar)
@@ -6956,7 +8752,7 @@ export function FondoSection({
     if (pageSize === "daily") {
       return filteredEntries.filter(
         (entry) =>
-          dateKeyFromDate(new Date(entry.createdAt)) === currentDailyKey
+          dateKeyFromDate(new Date(entry.createdAt)) === currentDailyKey,
       );
     }
     const start = pageIndex * pageSize;
@@ -7032,7 +8828,7 @@ export function FondoSection({
 
   const dateOnlyFormatter = useMemo(
     () => new Intl.DateTimeFormat("es-CR", { dateStyle: "medium" }),
-    []
+    [],
   );
   const formatGroupLabel = (isoDateKey: string) => {
     const [y, m, d] = isoDateKey.split("-").map(Number);
@@ -7052,39 +8848,12 @@ export function FondoSection({
 
   const closingsAreLoading =
     accountKey === "FondoGeneral" &&
+    dailyClosingHistoryOpen &&
     (!dailyClosingsHydrated || dailyClosingsRefreshing);
 
   const isFondoMovementsLoading = useMemo(() => {
     return Boolean(company) && (!entriesHydrated || movementsLoading);
   }, [company, entriesHydrated, movementsLoading]);
-  const visibleDailyClosings = useMemo(() => {
-    if (accountKey !== "FondoGeneral") return [] as DailyClosingRecord[];
-    if (!dailyClosingsHydrated) return [] as DailyClosingRecord[];
-    let base = dailyClosings;
-    if (isDailyMode) {
-      base = base.filter((record) => {
-        const key = dateKeyFromDate(new Date(record.closingDate));
-        return key === currentDailyKey;
-      });
-    } else if (fromFilter || toFilter) {
-      base = base.filter((record) => {
-        const key = dateKeyFromDate(new Date(record.closingDate));
-        if (fromFilter && toFilter) return key >= fromFilter && key <= toFilter;
-        if (fromFilter && !toFilter) return key === fromFilter;
-        if (!fromFilter && toFilter) return key === toFilter;
-        return true;
-      });
-    }
-    return base;
-  }, [
-    accountKey,
-    dailyClosings,
-    dailyClosingsHydrated,
-    isDailyMode,
-    currentDailyKey,
-    fromFilter,
-    toFilter,
-  ]);
 
   // Totals computed from the filtered entries (not only the current page)
   const isFilterActive = useMemo(() => {
@@ -7094,7 +8863,7 @@ export function FondoSection({
       (filterProviderCode && filterProviderCode !== "all") ||
       (filterPaymentType && filterPaymentType !== "all") ||
       filterEditedOnly ||
-      (searchQuery || "").trim().length > 0
+      (searchQuery || "").trim().length > 0,
     );
   }, [
     fromFilter,
@@ -7200,7 +8969,9 @@ export function FondoSection({
                 </option>
                 {sortedOwnerCompanies.map((emp, index) => (
                   <option
-                    key={emp.id || emp.name || emp.ubicacion || `company-${index}`}
+                    key={
+                      emp.id || emp.name || emp.ubicacion || `company-${index}`
+                    }
                     value={getCompanyKey(emp)}
                   >
                     {getCompanyLabel(emp)}
@@ -7309,21 +9080,21 @@ export function FondoSection({
                 const filteredProviders =
                   providerFilter.length === 0
                     ? [
-                      { code: "all", name: "Todos los proveedores" },
-                      ...providers,
-                    ]
+                        { code: "all", name: "Todos los proveedores" },
+                        ...providers,
+                      ]
                     : [
-                      { code: "all", name: "Todos los proveedores" },
-                      ...providers.filter(
-                        (p) =>
-                          p.name
-                            .toLowerCase()
-                            .includes(providerFilter.toLowerCase()) ||
-                          p.code
-                            .toLowerCase()
-                            .includes(providerFilter.toLowerCase())
-                      ),
-                    ];
+                        { code: "all", name: "Todos los proveedores" },
+                        ...providers.filter(
+                          (p) =>
+                            p.name
+                              .toLowerCase()
+                              .includes(providerFilter.toLowerCase()) ||
+                            p.code
+                              .toLowerCase()
+                              .includes(providerFilter.toLowerCase()),
+                        ),
+                      ];
                 return filteredProviders.length > 0 ? (
                   <div className="absolute z-10 w-full bg-[var(--input-bg)] border border-[var(--input-border)] rounded mt-1 max-h-60 overflow-y-auto shadow-lg">
                     {filteredProviders.map((p) => (
@@ -7333,7 +9104,7 @@ export function FondoSection({
                         onMouseDown={() => {
                           setFilterProviderCode(p.code);
                           setProviderFilter(
-                            p.code === "all" ? "" : `${p.name} (${p.code})`
+                            p.code === "all" ? "" : `${p.name} (${p.code})`,
                           );
                           setIsProviderDropdownOpen(false);
                         }}
@@ -7341,7 +9112,7 @@ export function FondoSection({
                           e.preventDefault();
                           setFilterProviderCode(p.code);
                           setProviderFilter(
-                            p.code === "all" ? "" : `${p.name} (${p.code})`
+                            p.code === "all" ? "" : `${p.name} (${p.code})`,
                           );
                           setIsProviderDropdownOpen(false);
                         }}
@@ -7378,43 +9149,46 @@ export function FondoSection({
                   label: string;
                   group: string;
                 }> = [
-                    { value: "all", label: "Todos los tipos", group: "" },
-                    ...FONDO_INGRESO_TYPES.map((t) => ({
-                      value: t,
-                      label: formatMovementType(t),
-                      group: "Ingresos",
-                    })),
-                    ...FONDO_GASTO_TYPES.map((t) => ({
-                      value: t,
-                      label: formatMovementType(t),
-                      group: "Gastos",
-                    })),
-                    ...FONDO_EGRESO_TYPES.map((t) => ({
-                      value: t,
-                      label: formatMovementType(t),
-                      group: "Egresos",
-                    })),
-                  ];
+                  { value: "all", label: "Todos los tipos", group: "" },
+                  ...FONDO_INGRESO_TYPES.map((t) => ({
+                    value: t,
+                    label: formatMovementType(t),
+                    group: "Ingresos",
+                  })),
+                  ...FONDO_GASTO_TYPES.map((t) => ({
+                    value: t,
+                    label: formatMovementType(t),
+                    group: "Gastos",
+                  })),
+                  ...FONDO_EGRESO_TYPES.map((t) => ({
+                    value: t,
+                    label: formatMovementType(t),
+                    group: "Egresos",
+                  })),
+                ];
                 const filteredTypes =
                   typeFilter.length === 0
                     ? allTypes
                     : allTypes.filter(
-                      (t) =>
-                        t.label
-                          .toLowerCase()
-                          .includes(typeFilter.toLowerCase()) ||
-                        t.value
-                          .toLowerCase()
-                          .includes(typeFilter.toLowerCase())
-                    );
+                        (t) =>
+                          t.label
+                            .toLowerCase()
+                            .includes(typeFilter.toLowerCase()) ||
+                          t.value
+                            .toLowerCase()
+                            .includes(typeFilter.toLowerCase()),
+                      );
                 if (filteredTypes.length === 0) return null;
 
-                const groupedTypes = filteredTypes.reduce((acc, type) => {
-                  const group = type.group || "general";
-                  if (!acc[group]) acc[group] = [];
-                  acc[group].push(type);
-                  return acc;
-                }, {} as Record<string, typeof filteredTypes>);
+                const groupedTypes = filteredTypes.reduce(
+                  (acc, type) => {
+                    const group = type.group || "general";
+                    if (!acc[group]) acc[group] = [];
+                    acc[group].push(type);
+                    return acc;
+                  },
+                  {} as Record<string, typeof filteredTypes>,
+                );
 
                 return (
                   <div className="absolute z-10 w-full bg-[var(--input-bg)] border border-[var(--input-border)] rounded mt-1 max-h-60 overflow-y-auto shadow-lg">
@@ -7580,7 +9354,7 @@ export function FondoSection({
                         const daysInMonth = new Date(
                           year,
                           month + 1,
-                          0
+                          0,
                         ).getDate();
 
                         for (let i = 0; i < start; i++)
@@ -7603,13 +9377,14 @@ export function FondoSection({
                                   setPageSize("all");
                                   setPageIndex(0);
                                 }}
-                                className={`py-1 rounded ${isSelected
-                                  ? "bg-[var(--accent)] text-white"
-                                  : "hover:bg-[var(--muted)]"
-                                  }`}
+                                className={`py-1 rounded ${
+                                  isSelected
+                                    ? "bg-[var(--accent)] text-white"
+                                    : "hover:bg-[var(--muted)]"
+                                }`}
                               >
                                 {day}
-                              </button>
+                              </button>,
                             );
                           } else {
                             cells.push(
@@ -7618,7 +9393,7 @@ export function FondoSection({
                                 className="py-1 text-[var(--muted-foreground)] opacity-60"
                               >
                                 {day}
-                              </div>
+                              </div>,
                             );
                           }
                         }
@@ -7726,7 +9501,7 @@ export function FondoSection({
                         const daysInMonth = new Date(
                           year,
                           month + 1,
-                          0
+                          0,
                         ).getDate();
 
                         for (let i = 0; i < start; i++)
@@ -7749,13 +9524,14 @@ export function FondoSection({
                                   setPageSize("all");
                                   setPageIndex(0);
                                 }}
-                                className={`py-1 rounded ${isSelected
-                                  ? "bg-[var(--accent)] text-white"
-                                  : "hover:bg-[var(--muted)]"
-                                  }`}
+                                className={`py-1 rounded ${
+                                  isSelected
+                                    ? "bg-[var(--accent)] text-white"
+                                    : "hover:bg-[var(--muted)]"
+                                }`}
                               >
                                 {day}
-                              </button>
+                              </button>,
                             );
                           } else {
                             cells.push(
@@ -7764,7 +9540,7 @@ export function FondoSection({
                                 className="py-1 text-[var(--muted-foreground)] opacity-60"
                               >
                                 {day}
-                              </div>
+                              </div>,
                             );
                           }
                         }
@@ -7800,41 +9576,53 @@ export function FondoSection({
             <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 mt-2">
               <select
                 className="border border-[var(--input-border)] rounded px-2 py-1 text-xs sm:text-sm bg-[var(--input-bg)]"
-                value={quickRange || ''}
+                value={quickRange || ""}
                 onChange={(e) => {
                   const v = e.target.value;
                   setQuickRange(v || null);
                   const now = new Date();
                   let from: Date | null = null;
                   let to: Date | null = null;
-                  if (v === 'today') {
+                  if (v === "today") {
                     const t = new Date(now);
                     from = to = t;
-                  } else if (v === 'yesterday') {
+                  } else if (v === "yesterday") {
                     const y = new Date(now);
                     y.setDate(now.getDate() - 1);
                     from = to = y;
-                  } else if (v === 'thisweek') {
+                  } else if (v === "thisweek") {
                     const day = now.getDay();
                     const diff = now.getDate() - day + (day === 0 ? -6 : 1); // Lunes como inicio
                     from = new Date(now.setDate(diff));
                     to = new Date();
-                  } else if (v === 'lastweek') {
+                  } else if (v === "lastweek") {
                     const day = now.getDay();
                     const diff = now.getDate() - day + (day === 0 ? -6 : 1) - 7;
                     from = new Date(now.getFullYear(), now.getMonth(), diff);
                     to = new Date(now.getFullYear(), now.getMonth(), diff + 6);
-                  } else if (v === 'lastmonth') {
-                    const first = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+                  } else if (v === "lastmonth") {
+                    const first = new Date(
+                      now.getFullYear(),
+                      now.getMonth() - 1,
+                      1,
+                    );
                     const last = new Date(now.getFullYear(), now.getMonth(), 0);
                     from = first;
                     to = last;
-                  } else if (v === 'month') {
-                    const first = new Date(now.getFullYear(), now.getMonth(), 1);
-                    const last = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+                  } else if (v === "month") {
+                    const first = new Date(
+                      now.getFullYear(),
+                      now.getMonth(),
+                      1,
+                    );
+                    const last = new Date(
+                      now.getFullYear(),
+                      now.getMonth() + 1,
+                      0,
+                    );
                     from = first;
                     to = last;
-                  } else if (v === 'last30') {
+                  } else if (v === "last30") {
                     const last = new Date();
                     const first = new Date();
                     first.setDate(last.getDate() - 29);
@@ -7863,7 +9651,10 @@ export function FondoSection({
               <div className="relative group mt-2 sm:mt-0">
                 <button
                   type="button"
-                  onClick={() => setDailyClosingHistoryOpen(true)}
+                  onClick={() => {
+                    setDailyClosingHistoryRange("today");
+                    setDailyClosingHistoryOpen(true);
+                  }}
                   disabled={closingsAreLoading}
                   className="inline-flex items-center justify-center h-8 w-8 rounded border border-[var(--input-border)] bg-[var(--input-bg)] hover:bg-[var(--muted)] transition-colors disabled:opacity-60"
                   title="Cierres anteriores"
@@ -7886,10 +9677,11 @@ export function FondoSection({
                   type="button"
                   onClick={handleOpenDailyClosing}
                   disabled={!pendingCierreDeCaja}
-                  className={`flex items-center justify-center gap-1.5 sm:gap-2 rounded px-3 sm:px-4 py-2 sm:py-2.5 text-white text-xs sm:text-sm w-full ${!pendingCierreDeCaja
-                    ? "bg-gray-400 cursor-not-allowed opacity-60"
-                    : "fg-add-mov-btn"
-                    }`}
+                  className={`flex items-center justify-center gap-1.5 sm:gap-2 rounded px-3 sm:px-4 py-2 sm:py-2.5 text-white text-xs sm:text-sm w-full ${
+                    !pendingCierreDeCaja
+                      ? "bg-gray-400 cursor-not-allowed opacity-60"
+                      : "fg-add-mov-btn"
+                  }`}
                 >
                   <Banknote className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                   <span className="whitespace-nowrap">Registrar cierre</span>
@@ -7911,11 +9703,12 @@ export function FondoSection({
                   (accountKey === "FondoGeneral" && pendingCierreDeCaja) ||
                   !entriesHydrated
                 }
-                className={`flex items-center justify-center gap-1.5 sm:gap-2 rounded px-3 sm:px-4 py-2 sm:py-2.5 text-white text-xs sm:text-sm w-full ${(accountKey === "FondoGeneral" && pendingCierreDeCaja) ||
+                className={`flex items-center justify-center gap-1.5 sm:gap-2 rounded px-3 sm:px-4 py-2 sm:py-2.5 text-white text-xs sm:text-sm w-full ${
+                  (accountKey === "FondoGeneral" && pendingCierreDeCaja) ||
                   !entriesHydrated
-                  ? "bg-gray-400 cursor-not-allowed opacity-60"
-                  : "fg-add-mov-btn"
-                  }`}
+                    ? "bg-gray-400 cursor-not-allowed opacity-60"
+                    : "fg-add-mov-btn"
+                }`}
               >
                 <Plus className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 <span className="whitespace-nowrap">Agregar movimiento</span>
@@ -8057,7 +9850,7 @@ export function FondoSection({
               onManagerChange={handleManagerChange}
               managerSelectDisabled={managerSelectDisabled}
               employeeOptions={employeeOptions}
-              employeesLoading={employeesLoading}
+              employeesLoading={managerOptionsLoading}
               editingEntryId={editingEntryId}
               onCancelEditing={cancelEditing}
               onSubmit={handleSubmitFondo}
@@ -8083,12 +9876,15 @@ export function FondoSection({
         </p>
       )}
 
-      {!employeesLoading && employeeOptions.length === 0 && company && (
-        <p className="text-sm text-[var(--muted-foreground)] mt-2">
-          La empresa no tiene empleados registrados; agrega empleados para
-          seleccionar un encargado.
-        </p>
-      )}
+      {!isSuperAdminUser &&
+        !managerOptionsLoading &&
+        employeeOptions.length === 0 &&
+        company && (
+          <p className="text-sm text-[var(--muted-foreground)] mt-2">
+            La empresa no tiene empleados registrados; agrega empleados para
+            seleccionar un encargado.
+          </p>
+        )}
 
       <div className="mt-6">
         <h3 className="text-xs sm:text-sm font-medium text-[var(--muted-foreground)] mb-2 text-center">
@@ -8409,7 +10205,7 @@ export function FondoSection({
                       const entryCurrency =
                         (fe.currency as "CRC" | "USD") || "CRC";
                       const normalizedIngreso = Math.trunc(
-                        fe.amountIngreso || 0
+                        fe.amountIngreso || 0,
                       );
                       const normalizedEgreso = Math.trunc(fe.amountEgreso || 0);
                       let isEntryEgreso =
@@ -8428,10 +10224,10 @@ export function FondoSection({
                         : normalizedIngreso;
                       const balanceAfter =
                         entryCurrency === "USD"
-                          ? balanceAfterByIdUSD.get(fe.id) ??
-                          Math.trunc(currentBalanceUSD)
-                          : balanceAfterByIdCRC.get(fe.id) ??
-                          Math.trunc(currentBalanceCRC);
+                          ? (balanceAfterByIdUSD.get(fe.id) ??
+                            Math.trunc(currentBalanceUSD))
+                          : (balanceAfterByIdCRC.get(fe.id) ??
+                            Math.trunc(currentBalanceCRC));
                       // compute the balance immediately before this movement was applied (in the movement currency)
                       const previousBalance = isEntryEgreso
                         ? balanceAfter + normalizedEgreso
@@ -8441,7 +10237,7 @@ export function FondoSection({
                         ? "Sin fecha"
                         : dateTimeFormatter.format(recordedAt);
                       const isAutoAdjustment = isAutoAdjustmentProvider(
-                        fe.providerCode
+                        fe.providerCode,
                       );
                       const isSuccessfulClosing =
                         isAutoAdjustment && movementAmount === 0;
@@ -8482,8 +10278,9 @@ export function FondoSection({
                               "providerCode" in after
                             ) {
                               parts.push(
-                                `Proveedor: ${before.providerCode ?? "—"} → ${after.providerCode ?? "—"
-                                }`
+                                `Proveedor: ${before.providerCode ?? "—"} → ${
+                                  after.providerCode ?? "—"
+                                }`,
                               );
                             }
                             if (
@@ -8491,8 +10288,9 @@ export function FondoSection({
                               "invoiceNumber" in after
                             ) {
                               parts.push(
-                                `Factura: ${before.invoiceNumber ?? "—"} → ${after.invoiceNumber ?? "—"
-                                }`
+                                `Factura: ${before.invoiceNumber ?? "—"} → ${
+                                  after.invoiceNumber ?? "—"
+                                }`,
                               );
                             }
                             if (
@@ -8500,8 +10298,9 @@ export function FondoSection({
                               "paymentType" in after
                             ) {
                               parts.push(
-                                `Tipo: ${before.paymentType ?? "—"} → ${after.paymentType ?? "—"
-                                }`
+                                `Tipo: ${before.paymentType ?? "—"} → ${
+                                  after.paymentType ?? "—"
+                                }`,
                               );
                             }
 
@@ -8513,7 +10312,7 @@ export function FondoSection({
                                 after.currency || entryCurrency || "CRC";
                               if (beforeCur !== afterCur) {
                                 parts.push(
-                                  `Moneda: ${beforeCur} → ${afterCur}`
+                                  `Moneda: ${beforeCur} → ${afterCur}`,
                                 );
                               }
                             }
@@ -8526,10 +10325,12 @@ export function FondoSection({
                               "amountIngreso" in after
                             ) {
                               const beforeAmt = Number(
-                                before.amountEgreso || before.amountIngreso || 0
+                                before.amountEgreso ||
+                                  before.amountIngreso ||
+                                  0,
                               );
                               const afterAmt = Number(
-                                after.amountEgreso || after.amountIngreso || 0
+                                after.amountEgreso || after.amountIngreso || 0,
                               );
                               const beforeCur =
                                 (before.currency as "CRC" | "USD") ||
@@ -8542,27 +10343,30 @@ export function FondoSection({
                               parts.push(
                                 `Monto: ${formatByCurrency(
                                   beforeCur,
-                                  beforeAmt
-                                )} → ${formatByCurrency(afterCur, afterAmt)}`
+                                  beforeAmt,
+                                )} → ${formatByCurrency(afterCur, afterAmt)}`,
                               );
                             }
 
                             if ("manager" in before || "manager" in after) {
                               parts.push(
-                                `Encargado: ${before.manager ?? "—"} → ${after.manager ?? "—"
-                                }`
+                                `Encargado: ${before.manager ?? "—"} → ${
+                                  after.manager ?? "—"
+                                }`,
                               );
                             }
                             if ("notes" in before || "notes" in after) {
                               parts.push(
-                                `Notas: "${before.notes ?? ""}" → "${after.notes ?? ""
-                                }"`
+                                `Notas: "${before.notes ?? ""}" → "${
+                                  after.notes ?? ""
+                                }"`,
                               );
                             }
 
-                            return `${at}: ${parts.join("; ") ||
+                            return `${at}: ${
+                              parts.join("; ") ||
                               "Editado (sin cambios detectados)"
-                              } `;
+                            } `;
                           });
                           auditTooltip = lines.join("\n");
                         } catch {
@@ -8573,8 +10377,9 @@ export function FondoSection({
                       return (
                         <tr
                           key={fe.id}
-                          className={`border-t border-[var(--input-border)] hover:bg-[var(--muted)] ${isMostRecent ? "bg-[#273238]" : ""
-                            } ${isMovementLocked(fe) ? "opacity-60" : ""}`}
+                          className={`border-t border-[var(--input-border)] hover:bg-[var(--muted)] ${
+                            isMostRecent ? "bg-[#273238]" : ""
+                          } ${isMovementLocked(fe) ? "opacity-60" : ""}`}
                         >
                           <td className="px-3 py-2 align-top text-[var(--muted-foreground)]">
                             {formattedDate}
@@ -8619,15 +10424,15 @@ export function FondoSection({
                                     const parts = fe.notes.split("\n");
                                     const headerText =
                                       parts.find(
-                                        (p) => !p.includes("[ALERT_ICON]")
+                                        (p) => !p.includes("[ALERT_ICON]"),
                                       ) || "";
                                     const alertLine =
                                       parts.find((p) =>
-                                        p.includes("[ALERT_ICON]")
+                                        p.includes("[ALERT_ICON]"),
                                       ) || "";
                                     const noteText = alertLine.replace(
                                       "[ALERT_ICON]",
-                                      ""
+                                      "",
                                     );
                                     return (
                                       <div className="flex flex-col gap-1">
@@ -8646,7 +10451,7 @@ export function FondoSection({
                                   if (fe.notes.startsWith("[CHECK_ICON]")) {
                                     const noteText = fe.notes.replace(
                                       "[CHECK_ICON]",
-                                      ""
+                                      "",
                                     );
                                     return (
                                       <div className="flex items-center gap-1.5">
@@ -8667,7 +10472,116 @@ export function FondoSection({
                             #{fe.invoiceNumber}
                           </td>
                           <td className="px-3 py-2 align-top">
-                            {isSuccessfulClosing ? (
+                            {isAutoAdjustment ? (
+                              (() => {
+                                const closingRecord = fe.originalEntryId
+                                  ? dailyClosings.find(
+                                      (d) => d.id === fe.originalEntryId,
+                                    )
+                                  : null;
+
+                                const hasPersistedClosingBalance =
+                                  fe.closingBalanceCRC !== undefined ||
+                                  fe.closingBalanceUSD !== undefined ||
+                                  Boolean(closingRecord);
+
+                                if (!hasPersistedClosingBalance) {
+                                  if (isSuccessfulClosing) {
+                                    return (
+                                      <div className="text-center text-[var(--muted-foreground)]">
+                                        —
+                                      </div>
+                                    );
+                                  }
+
+                                  return (
+                                    <div className="flex flex-col gap-1 text-right">
+                                      <div className="flex items-center justify-end gap-2">
+                                        {isEntryEgreso ? (
+                                          <ArrowUpRight className="w-4 h-4 text-red-500" />
+                                        ) : (
+                                          <ArrowDownRight className="w-4 h-4 text-green-500" />
+                                        )}
+                                        <span
+                                          className={`font-semibold ${
+                                            isEntryEgreso
+                                              ? "text-red-500"
+                                              : "text-green-600"
+                                          }`}
+                                        >
+                                          {`${amountPrefix} ${formatByCurrency(
+                                            entryCurrency,
+                                            movementAmount,
+                                          )}`}
+                                        </span>
+                                      </div>
+                                      <span className="text-xs text-[var(--muted-foreground)]">
+                                        Saldo anterior:{" "}
+                                        {formatByCurrency(
+                                          entryCurrency,
+                                          previousBalance,
+                                        )}
+                                      </span>
+                                    </div>
+                                  );
+                                }
+
+                                const closingCRC = Math.trunc(
+                                  fe.closingBalanceCRC ??
+                                    closingRecord?.totalCRC ??
+                                    closingRecord?.recordedBalanceCRC ??
+                                    0,
+                                );
+                                const closingUSD = Math.trunc(
+                                  fe.closingBalanceUSD ??
+                                    closingRecord?.totalUSD ??
+                                    closingRecord?.recordedBalanceUSD ??
+                                    0,
+                                );
+
+                                return (
+                                  <div className="flex flex-col gap-1 text-right">
+                                    {movementAmount !== 0 ? (
+                                      <div className="flex items-center justify-end gap-2">
+                                        {isEntryEgreso ? (
+                                          <ArrowUpRight className="w-4 h-4 text-red-500" />
+                                        ) : (
+                                          <ArrowDownRight className="w-4 h-4 text-green-500" />
+                                        )}
+                                        <span
+                                          className={`font-semibold ${
+                                            isEntryEgreso
+                                              ? "text-red-500"
+                                              : "text-green-600"
+                                          }`}
+                                        >
+                                          {`${amountPrefix} ${formatByCurrency(
+                                            entryCurrency,
+                                            movementAmount,
+                                          )}`}
+                                        </span>
+                                      </div>
+                                    ) : null}
+
+                                    <div className="text-xs text-[var(--muted-foreground)]">
+                                      Saldo al cierre
+                                    </div>
+                                    <div className="text-sm font-semibold text-[var(--foreground)] flex flex-col gap-0.5">
+                                      {currencyEnabled.CRC && (
+                                        <div>
+                                          {formatByCurrency("CRC", closingCRC)}
+                                        </div>
+                                      )}
+                                      {currencyEnabled.USD && (
+                                        <div>
+                                          {formatByCurrency("USD", closingUSD)}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                );
+                              })()
+                            ) : isSuccessfulClosing ? (
                               <div className="text-center text-[var(--muted-foreground)]">
                                 —
                               </div>
@@ -8680,14 +10594,15 @@ export function FondoSection({
                                     <ArrowDownRight className="w-4 h-4 text-green-500" />
                                   )}
                                   <span
-                                    className={`font-semibold ${isEntryEgreso
-                                      ? "text-red-500"
-                                      : "text-green-600"
-                                      }`}
+                                    className={`font-semibold ${
+                                      isEntryEgreso
+                                        ? "text-red-500"
+                                        : "text-green-600"
+                                    }`}
                                   >
                                     {`${amountPrefix} ${formatByCurrency(
                                       entryCurrency,
-                                      movementAmount
+                                      movementAmount,
                                     )}`}
                                   </span>
                                 </div>
@@ -8695,7 +10610,7 @@ export function FondoSection({
                                   Saldo anterior:{" "}
                                   {formatByCurrency(
                                     entryCurrency,
-                                    previousBalance
+                                    previousBalance,
                                   )}
                                 </span>
                               </div>
@@ -8707,33 +10622,70 @@ export function FondoSection({
                           <td className="px-3 py-2 align-top">
                             {!isMovementLocked(fe) && (
                               <div className="flex items-center gap-2">
-                                <button
-                                  type="button"
-                                  className="inline-flex items-center gap-2 rounded border border-[var(--input-border)] px-3 py-1 text-xs font-medium text-[var(--muted-foreground)] hover:bg-[var(--muted)] disabled:opacity-50"
-                                  onClick={() => handleEditMovement(fe)}
-                                  disabled={editingEntryId === fe.id}
-                                  title={
-                                    isAutoAdjustment
-                                      ? "Los ajustes automáticos no se pueden editar"
-                                      : "Editar movimiento"
-                                  }
-                                >
-                                  <Pencil className="w-4 h-4" />
-                                  {editingEntryId === fe.id
-                                    ? "Editando"
-                                    : "Editar"}
-                                </button>
-                                {isPrincipalAdmin && !isAutoAdjustment && (
-                                  <button
-                                    type="button"
-                                    className="inline-flex items-center gap-2 rounded border border-red-500/50 px-3 py-1 text-xs font-medium text-red-500 hover:bg-red-500/10"
-                                    onClick={() => handleDeleteMovement(fe)}
-                                    title="Eliminar movimiento (solo admin principal)"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                    Eliminar
-                                  </button>
-                                )}
+                                {(() => {
+                                  const isCierreVentasRow =
+                                    isCierreFondoVentasMovement(fe);
+                                  const isLatestCierreVentas =
+                                    isCierreVentasRow &&
+                                    Boolean(
+                                      latestCierreFondoVentasMovementId,
+                                    ) &&
+                                    fe.id === latestCierreFondoVentasMovementId;
+                                  const canDelete =
+                                    !isAutoAdjustment &&
+                                    (isPrincipalAdmin ||
+                                      (isSuperAdminUser &&
+                                        isCierreVentasRow)) &&
+                                    (!isCierreVentasRow ||
+                                      isLatestCierreVentas);
+                                  const canEdit =
+                                    !isAutoAdjustment &&
+                                    (!isSuperAdminUser || !isCierreVentasRow);
+
+                                  return (
+                                    <>
+                                      {canEdit && (
+                                        <button
+                                          type="button"
+                                          className="inline-flex items-center gap-2 rounded border border-[var(--input-border)] px-3 py-1 text-xs font-medium text-[var(--muted-foreground)] hover:bg-[var(--muted)] disabled:opacity-50"
+                                          onClick={() => handleEditMovement(fe)}
+                                          disabled={editingEntryId === fe.id}
+                                          title={
+                                            isAutoAdjustment
+                                              ? "Los ajustes automáticos no se pueden editar"
+                                              : "Editar movimiento"
+                                          }
+                                        >
+                                          <Pencil className="w-4 h-4" />
+                                          {editingEntryId === fe.id
+                                            ? "Editando"
+                                            : "Editar"}
+                                        </button>
+                                      )}
+
+                                      {canDelete && (
+                                        <button
+                                          type="button"
+                                          className="inline-flex items-center gap-2 rounded border border-red-500/50 px-3 py-1 text-xs font-medium text-red-500 hover:bg-red-500/10"
+                                          onClick={() =>
+                                            handleDeleteMovement(fe)
+                                          }
+                                          title={
+                                            isCierreVentasRow &&
+                                            isSuperAdminUser
+                                              ? 'Eliminar "CIERRE FONDO VENTAS" (superadmin)'
+                                              : isCierreVentasRow
+                                                ? "Eliminar último cierre de Fondo Ventas"
+                                                : "Eliminar movimiento"
+                                          }
+                                        >
+                                          <Trash2 className="w-4 h-4" />
+                                          Eliminar
+                                        </button>
+                                      )}
+                                    </>
+                                  );
+                                })()}
                               </div>
                             )}
                           </td>
@@ -8749,94 +10701,99 @@ export function FondoSection({
       </div>
 
       {/* Totals for the current search / filters */}
-      {isSingleDayFilter && filteredEntries.length > 0 && (isAdminUser || isSuperAdminUser) && (
-        <div className="mt-4">
-          <div className="flex justify-center">
-            <div className="w-full max-w-2xl">
-              <div className="px-4 py-3 rounded min-w-[220px] fg-balance-card">
-                {isSuperAdminUser ? (
-                  <button
-                    type="button"
-                    onClick={() => setSuperAdminTotalsOpen((p) => !p)}
-                    className="w-full flex items-center justify-between gap-3"
-                    aria-expanded={superAdminTotalsOpen}
-                  >
-                    <div className="text-center font-semibold text-sm text-[var(--muted-foreground)] flex-1">
+      {isSingleDayFilter &&
+        filteredEntries.length > 0 &&
+        (isAdminUser || isSuperAdminUser) && (
+          <div className="mt-4">
+            <div className="flex justify-center">
+              <div className="w-full max-w-2xl">
+                <div className="px-4 py-3 rounded min-w-[220px] fg-balance-card">
+                  {isSuperAdminUser ? (
+                    <button
+                      type="button"
+                      onClick={() => setSuperAdminTotalsOpen((p) => !p)}
+                      className="w-full flex items-center justify-between gap-3"
+                      aria-expanded={superAdminTotalsOpen}
+                    >
+                      <div className="text-center font-semibold text-sm text-[var(--muted-foreground)] flex-1">
+                        Total del día
+                      </div>
+                      {superAdminTotalsOpen ? (
+                        <ChevronUp className="w-4 h-4 text-[var(--muted-foreground)]" />
+                      ) : (
+                        <ChevronDown className="w-4 h-4 text-[var(--muted-foreground)]" />
+                      )}
+                    </button>
+                  ) : (
+                    <div className="mb-2 text-center font-semibold text-sm text-[var(--muted-foreground)]">
                       Total del día
                     </div>
-                    {superAdminTotalsOpen ? (
-                      <ChevronUp className="w-4 h-4 text-[var(--muted-foreground)]" />
-                    ) : (
-                      <ChevronDown className="w-4 h-4 text-[var(--muted-foreground)]" />
-                    )}
-                  </button>
-                ) : (
-                  <div className="mb-2 text-center font-semibold text-sm text-[var(--muted-foreground)]">
-                    Total del día
-                  </div>
-                )}
+                  )}
 
-                {(!isSuperAdminUser || superAdminTotalsOpen) && (
-                  <div className={isSuperAdminUser ? "mt-3" : ""}>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      {(["CRC", "USD"] as ("CRC" | "USD")[]).map((currency) => {
-                        const ingreso = totalsByCurrency[currency].ingreso;
-                        const egreso = totalsByCurrency[currency].egreso;
-                        const neto = ingreso - egreso;
-                        return (
-                          <div
-                            key={currency}
-                            className="rounded border border-[var(--input-border)] bg-[var(--card-bg)] p-3"
-                          >
-                            <div className="text-xs uppercase tracking-wide">
-                              {currency === "CRC" ? "Colones" : "Dólares"}
-                            </div>
-                            <div className="mt-2 text-[var(--foreground)]">
-                              <div className="flex items-center gap-2">
-                                <ArrowDownRight className="w-4 h-4 text-green-500" />
-                                <div>
-                                  Entradas:{" "}
-                                  <span className="font-semibold text-green-500">
-                                    {formatByCurrency(currency, ingreso)}
-                                  </span>
+                  {(!isSuperAdminUser || superAdminTotalsOpen) && (
+                    <div className={isSuperAdminUser ? "mt-3" : ""}>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {(["CRC", "USD"] as ("CRC" | "USD")[]).map(
+                          (currency) => {
+                            const ingreso = totalsByCurrency[currency].ingreso;
+                            const egreso = totalsByCurrency[currency].egreso;
+                            const neto = ingreso - egreso;
+                            return (
+                              <div
+                                key={currency}
+                                className="rounded border border-[var(--input-border)] bg-[var(--card-bg)] p-3"
+                              >
+                                <div className="text-xs uppercase tracking-wide">
+                                  {currency === "CRC" ? "Colones" : "Dólares"}
+                                </div>
+                                <div className="mt-2 text-[var(--foreground)]">
+                                  <div className="flex items-center gap-2">
+                                    <ArrowDownRight className="w-4 h-4 text-green-500" />
+                                    <div>
+                                      Entradas:{" "}
+                                      <span className="font-semibold text-green-500">
+                                        {formatByCurrency(currency, ingreso)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center gap-2 mt-1">
+                                    <ArrowUpRight className="w-4 h-4 text-red-500" />
+                                    <div>
+                                      Salidas:{" "}
+                                      <span className="font-semibold text-red-500">
+                                        {formatByCurrency(currency, egreso)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="pt-2">
+                                    <div>
+                                      Neto:{" "}
+                                      <span
+                                        className={`font-semibold ${
+                                          neto > 0
+                                            ? "text-green-500"
+                                            : neto < 0
+                                              ? "text-red-500"
+                                              : ""
+                                        }`}
+                                      >
+                                        {formatByCurrency(currency, neto)}
+                                      </span>
+                                    </div>
+                                  </div>
                                 </div>
                               </div>
-                              <div className="flex items-center gap-2 mt-1">
-                                <ArrowUpRight className="w-4 h-4 text-red-500" />
-                                <div>
-                                  Salidas:{" "}
-                                  <span className="font-semibold text-red-500">
-                                    {formatByCurrency(currency, egreso)}
-                                  </span>
-                                </div>
-                              </div>
-                              <div className="pt-2">
-                                <div>
-                                  Neto:{" "}
-                                  <span
-                                    className={`font-semibold ${neto > 0
-                                      ? "text-green-500"
-                                      : neto < 0
-                                        ? "text-red-500"
-                                        : ""
-                                      }`}
-                                  >
-                                    {formatByCurrency(currency, neto)}
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
+                            );
+                          },
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
       <div className="mt-5">
         <div className="flex justify-center">
@@ -8875,61 +10832,14 @@ export function FondoSection({
         </div>
       </div>
 
-      {auditModalOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-gray-800/60 px-4"
-          onClick={() => setAuditModalOpen(false)}
-        >
-          <div
-            className="w-full max-w-2xl rounded border border-[var(--input-border)] bg-[#1f262a] p-6 shadow-lg text-white"
-            onClick={(e) => e.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="audit-modal-title"
-          >
-            <h3 id="audit-modal-title" className="text-lg font-semibold">
-              Historial de edición
-            </h3>
-            <div className="mt-4 space-y-3 max-h-[60vh] overflow-auto">
-              {auditModalData?.history?.map((h, idx) => (
-                <div key={idx} className="p-3 bg-[#0f1516] rounded">
-                  <div className="text-xs text-[var(--muted-foreground)]">
-                    Cambio {idx + 1} —{" "}
-                    {h?.at ? dateTimeFormatter.format(new Date(h.at)) : "—"}
-                  </div>
-                  <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
-                      <div className="text-xs text-[var(--muted-foreground)]">
-                        Antes
-                      </div>
-                      <pre className="mt-2 text-sm bg-[#0b1011] p-3 rounded overflow-auto max-h-48">
-                        {JSON.stringify(h?.before ?? {}, null, 2)}
-                      </pre>
-                    </div>
-                    <div>
-                      <div className="text-xs text-[var(--muted-foreground)]">
-                        Después
-                      </div>
-                      <pre className="mt-2 text-sm bg-[#0b1011] p-3 rounded overflow-auto max-h-48">
-                        {JSON.stringify(h?.after ?? {}, null, 2)}
-                      </pre>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="flex justify-end mt-4">
-              <button
-                type="button"
-                onClick={() => setAuditModalOpen(false)}
-                className="px-4 py-2 border border-[var(--input-border)] rounded"
-              >
-                Cerrar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <AuditHistoryModal
+        open={auditModalOpen}
+        onClose={() => setAuditModalOpen(false)}
+        auditModalData={auditModalData}
+        dateTimeFormatter={dateTimeFormatter}
+        formatByCurrency={formatByCurrency}
+        providersMap={providersMap}
+      />
       {/* daily closings block removed from inline view */}
       <DailyClosingModal
         open={dailyClosingModalOpen}
@@ -8937,7 +10847,10 @@ export function FondoSection({
         onConfirm={handleConfirmDailyClosing}
         initialValues={dailyClosingInitialValues}
         editId={editingDailyClosingId}
-        onShowHistory={() => setDailyClosingHistoryOpen(true)}
+        onShowHistory={() => {
+          setDailyClosingHistoryRange("today");
+          setDailyClosingHistoryOpen(true);
+        }}
         employees={employeeOptions}
         loadingEmployees={employeesLoading}
         currentBalanceCRC={currentBalanceCRC}
@@ -8946,10 +10859,43 @@ export function FondoSection({
       />
 
       <ConfirmModal
+        open={confirmPhysicalCountOpen}
+        title="Confirmar conteo físico"
+        message={
+          <div className="text-left space-y-3">
+            <div className="text-sm text-[var(--muted-foreground)]">
+              Antes de registrar el primer movimiento después del último cierre,
+              confirma que el fondo fue contado físicamente.
+            </div>
+
+            <label className="flex items-start gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                className="mt-0.5 cursor-pointer"
+                checked={physicalCountWasDone}
+                onChange={(e) => setPhysicalCountWasDone(e.target.checked)}
+                aria-label="Confirmar que el fondo fue contado físicamente"
+              />
+              <span className="text-sm">
+                Sí, el fondo fue contado físicamente
+              </span>
+            </label>
+          </div>
+        }
+        confirmText="Continuar"
+        cancelText="Cancelar"
+        actionType="change"
+        confirmDisabled={!physicalCountWasDone}
+        onConfirm={handleConfirmPhysicalCount}
+        onCancel={handleCancelPhysicalCount}
+      />
+
+      <ConfirmModal
         open={confirmOpenCreateMovement}
         title="Confirmar empresa y cuenta"
-        message={`Vas a registrar un movimiento en la empresa "${company || ""
-          }" y en la cuenta "${accountKey}". Verifica que sea correcto antes de continuar.`}
+        message={`Vas a registrar un movimiento en la empresa "${
+          company || ""
+        }" y en la cuenta "${accountKey}". Verifica que sea correcto antes de continuar.`}
         confirmText="Continuar"
         cancelText="Cancelar"
         actionType="change"
@@ -8958,10 +10904,82 @@ export function FondoSection({
       />
 
       <ConfirmModal
+        open={negativeBalanceModal.open}
+        title="Saldo insuficiente"
+        message={
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Esta acción no puede llevarse a cabo porque el saldo quedaría en
+              negativo.
+            </p>
+
+            <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-4 space-y-3">
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-muted-foreground">
+                  Monto de la salida
+                </span>
+                <span className="font-semibold">
+                  {negativeBalanceModal.currency === "USD" ? "$ " : "₡ "}
+                  {new Intl.NumberFormat(
+                    negativeBalanceModal.currency === "USD" ? "en-US" : "es-CR",
+                    {
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 0,
+                    },
+                  ).format(negativeBalanceModal.amount)}
+                </span>
+              </div>
+
+              <div className="border-t border-destructive/20" />
+
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-muted-foreground">
+                  Saldo resultante
+                </span>
+                <span className="font-semibold text-destructive flex items-center gap-1">
+                  <span>▼</span>
+                  {negativeBalanceModal.currency === "USD" ? "$ " : "₡ "}
+                  {new Intl.NumberFormat(
+                    negativeBalanceModal.currency === "USD" ? "en-US" : "es-CR",
+                    {
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 0,
+                    },
+                  ).format(negativeBalanceModal.resultingNegativeAmount)}
+                </span>
+              </div>
+            </div>
+          </div>
+        }
+        confirmText="De Acuerdo"
+        cancelText=""
+        singleButton={true}
+        singleButtonText="De Acuerdo"
+        actionType="assign"
+        onConfirm={() =>
+          setNegativeBalanceModal({
+            open: false,
+            amount: 0,
+            currency: "CRC",
+            resultingNegativeAmount: 0,
+          })
+        }
+        onCancel={() =>
+          setNegativeBalanceModal({
+            open: false,
+            amount: 0,
+            currency: "CRC",
+            resultingNegativeAmount: 0,
+          })
+        }
+      />
+
+      <ConfirmModal
         open={confirmDeleteEntry.open}
         title="Eliminar movimiento"
-        message={`¿Está seguro que desea eliminar el movimiento #${confirmDeleteEntry.entry?.invoiceNumber || ""
-          }? Esta acción no se puede deshacer.`}
+        message={`¿Está seguro que desea eliminar el movimiento #${
+          confirmDeleteEntry.entry?.invoiceNumber || ""
+        }? Esta acción no se puede deshacer.`}
         confirmText="Eliminar"
         onConfirm={confirmDeleteMovement}
         onCancel={cancelDeleteMovement}
@@ -8973,7 +10991,8 @@ export function FondoSection({
         onClose={() => setDailyClosingHistoryOpen(false)}
         closingsAreLoading={closingsAreLoading}
         dailyClosings={dailyClosings}
-        visibleDailyClosings={visibleDailyClosings}
+        quickRange={dailyClosingHistoryRange}
+        onQuickRangeChange={setDailyClosingHistoryRange}
         dailyClosingDateFormatter={dailyClosingDateFormatter}
         dateTimeFormatter={dateTimeFormatter}
         buildBreakdownLines={buildBreakdownLines}
@@ -8984,6 +11003,14 @@ export function FondoSection({
         isAutoAdjustmentProvider={isAutoAdjustmentProvider}
         expandedClosings={expandedClosings}
         setExpandedClosings={setExpandedClosings}
+        canDeleteLatestClosing={
+          Boolean(isSuperAdminUser) &&
+          accountKey === "FondoGeneral" &&
+          Boolean((company || "").trim()) &&
+          dailyClosings.length > 0
+        }
+        latestClosingLabel={latestDailyClosingLabel}
+        onDeleteLatestClosing={handleDeleteLatestDailyClosing}
       />
     </div>
   );

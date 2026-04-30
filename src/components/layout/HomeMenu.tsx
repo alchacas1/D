@@ -1,7 +1,13 @@
 "use client";
 import Image from "next/image";
 import Fireworks from "fireworks-js";
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   DndContext,
   PointerSensor,
@@ -29,6 +35,8 @@ import {
   Settings,
   History,
   Users,
+  Star,
+  Plus,
 } from "lucide-react";
 import AnimatedStickman from "../ui/AnimatedStickman";
 import { CustomIcon } from "../../icons/icons";
@@ -47,6 +55,20 @@ import {
   weekStartKeyFromDateKey,
 } from "../../utils/dateKey";
 import { SupplierWeekSection } from "../business/SupplierWeekSection";
+import {
+  getAccessibleHomeMenuFavoriteOptions,
+  HomeMenuFavoriteOption,
+  HomeMenuFavoriteGroup,
+  HomeMenuMaintenanceTab,
+} from "./homeMenuFavoritesCatalog";
+import {
+  addHomeMenuFavorite,
+  getHomeMenuFavorites,
+  removeHomeMenuFavorite,
+} from "../../services/homeMenuFavoritesDb";
+
+const MAINTENANCE_TAB_STORAGE_KEY = "pricemaster:maintenance-active-tab";
+const MAINTENANCE_TAB_EVENT = "pricemaster:maintenance-tab-change";
 
 const menuItems = [
   {
@@ -111,6 +133,13 @@ const menuItems = [
     icon: Users,
     description: "Información de empleados",
     permission: "empleados" as keyof UserPermissions,
+  },
+  {
+    id: "funciones",
+    name: "Funciones",
+    icon: Clock,
+    description: "Ver funciones por empresa",
+    permission: "notificaciones" as keyof UserPermissions,
   },
   {
     id: "recetas",
@@ -184,8 +213,14 @@ function SortableHomeMenuCard({
   style?: React.CSSProperties;
   children: React.ReactNode;
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id });
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id });
 
   const mergedStyle: React.CSSProperties = {
     ...style,
@@ -219,17 +254,30 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
   const [clickCount, setClickCount] = useState(0);
   const [showStickman, setShowStickman] = useState(false);
   const [showSupplierWeekInMenu, setShowSupplierWeekInMenu] = useState(false);
-  const [enableHomeMenuSortMobile, setEnableHomeMenuSortMobile] = useState(false);
+  const [enableHomeMenuSortMobile, setEnableHomeMenuSortMobile] =
+    useState(false);
+  const [showFavoritesView, setShowFavoritesView] = useState(false);
+  const [favoritesPreferenceHydrated, setFavoritesPreferenceHydrated] =
+    useState(false);
+  const [favoriteMenuIds, setFavoriteMenuIds] = useState<string[]>([]);
+  const [showAddFavoriteModal, setShowAddFavoriteModal] = useState(false);
+  const [favoritesLoading, setFavoritesLoading] = useState(false);
   const [currentHash, setCurrentHash] = useState("");
-  const [supplierWeekAnchorKey, setSupplierWeekAnchorKey] = useState<number>(() =>
-    dateToKey(new Date())
+  const [supplierWeekAnchorKey, setSupplierWeekAnchorKey] = useState<number>(
+    () => dateToKey(new Date()),
   );
-  const [selectedCreateDateKey, setSelectedCreateDateKey] = useState<number | null>(null);
+  const [selectedCreateDateKey, setSelectedCreateDateKey] = useState<
+    number | null
+  >(null);
   const [selectedProviderCode, setSelectedProviderCode] = useState<string>("");
-  const [selectedReceiveDateKey, setSelectedReceiveDateKey] = useState<number | null>(null);
+  const [selectedReceiveDateKey, setSelectedReceiveDateKey] = useState<
+    number | null
+  >(null);
   const [orderAmount, setOrderAmount] = useState<string>("");
   const [orderSaving, setOrderSaving] = useState(false);
-  const [fondoGeneralBalanceCRC, setFondoGeneralBalanceCRC] = useState<number | null>(null);
+  const [fondoGeneralBalanceCRC, setFondoGeneralBalanceCRC] = useState<
+    number | null
+  >(null);
 
   const fireworksRef = useRef<HTMLDivElement>(null);
 
@@ -272,6 +320,12 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     return `pricemaster:home-menu-order:${userKey}`;
   }, [currentUser]);
 
+  const homeMenuFavoritesStorageKey = useMemo(() => {
+    if (!currentUser) return null;
+    const userKey = (currentUser.id || currentUser.email || "anonymous").trim();
+    return userKey;
+  }, [currentUser]);
+
   const [savedMenuOrder, setSavedMenuOrder] = useState<string[]>([]);
 
   // Preference: allow HomeMenu reordering on mobile
@@ -279,7 +333,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     if (typeof window === "undefined") return;
 
     const readPreference = () => {
-      const savedPreference = localStorage.getItem("enable-home-menu-sort-mobile");
+      const savedPreference = localStorage.getItem(
+        "enable-home-menu-sort-mobile",
+      );
       setEnableHomeMenuSortMobile(savedPreference === "true");
     };
 
@@ -297,9 +353,146 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     window.addEventListener("pricemaster:preference-change", handlePrefChange);
     return () => {
       window.removeEventListener("storage", handleStorage);
-      window.removeEventListener("pricemaster:preference-change", handlePrefChange);
+      window.removeEventListener(
+        "pricemaster:preference-change",
+        handlePrefChange,
+      );
     };
   }, []);
+
+  // Guardar preferencia de vista favoritos del HomeMenu
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      if (!favoritesPreferenceHydrated) return;
+
+      localStorage.setItem(
+        "pricemaster:home-menu-show-favorites",
+        showFavoritesView.toString(),
+      );
+
+      window.dispatchEvent(
+        new CustomEvent("pricemaster:preference-change", {
+          detail: { key: "pricemaster:home-menu-show-favorites" },
+        }),
+      );
+    }
+  }, [showFavoritesView, favoritesPreferenceHydrated]);
+
+  // Cargar preferencia para vista de favoritos en HomeMenu
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const savedPreference = localStorage.getItem(
+        "pricemaster:home-menu-show-favorites",
+      );
+      setShowFavoritesView(savedPreference === "true");
+      setFavoritesPreferenceHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const readFavoritesViewPreference = () => {
+      const savedPreference = localStorage.getItem(
+        "pricemaster:home-menu-show-favorites",
+      );
+      setShowFavoritesView(savedPreference === "true");
+    };
+
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === "pricemaster:home-menu-show-favorites") {
+        readFavoritesViewPreference();
+      }
+    };
+
+    const handlePrefChange = (e: Event) => {
+      const key = (e as CustomEvent)?.detail?.key;
+      if (key === "pricemaster:home-menu-show-favorites") {
+        readFavoritesViewPreference();
+      }
+    };
+
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener("pricemaster:preference-change", handlePrefChange);
+
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(
+        "pricemaster:preference-change",
+        handlePrefChange,
+      );
+    };
+  }, []);
+
+  const accessibleFavoriteOptions = useMemo(
+    () => getAccessibleHomeMenuFavoriteOptions(currentUser),
+    [currentUser],
+  );
+
+  const accessibleFavoriteOptionsById = useMemo(() => {
+    return new Map(
+      accessibleFavoriteOptions.map((item) => [item.id, item] as const),
+    );
+  }, [accessibleFavoriteOptions]);
+
+  const favoriteMenuItems = useMemo(() => {
+    return favoriteMenuIds
+      .map((id) => accessibleFavoriteOptionsById.get(id))
+      .filter(Boolean) as HomeMenuFavoriteOption[];
+  }, [favoriteMenuIds, accessibleFavoriteOptionsById]);
+
+  const favoriteGroupOrder: HomeMenuFavoriteGroup[] = [
+    "Herramientas",
+    "Recetas",
+    "Fondo General",
+    "Mantenimiento",
+  ];
+
+  const favoriteOptionsByGroup = useMemo(() => {
+    return favoriteGroupOrder.reduce(
+      (acc, group) => {
+        acc[group] = accessibleFavoriteOptions.filter(
+          (item) => item.group === group,
+        );
+        return acc;
+      },
+      {} as Record<HomeMenuFavoriteGroup, HomeMenuFavoriteOption[]>,
+    );
+  }, [accessibleFavoriteOptions]);
+
+  useEffect(() => {
+    if (!homeMenuFavoritesStorageKey) {
+      setFavoriteMenuIds([]);
+      return;
+    }
+
+    let cancelled = false;
+    setFavoritesLoading(true);
+
+    const loadFavorites = async () => {
+      try {
+        const ids = await getHomeMenuFavorites(homeMenuFavoritesStorageKey);
+        if (!cancelled) {
+          setFavoriteMenuIds(ids);
+        }
+      } catch (error) {
+        console.error("Error loading HomeMenu favorites:", error);
+        if (!cancelled) {
+          setFavoriteMenuIds([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setFavoritesLoading(false);
+        }
+      }
+    };
+
+    void loadFavorites();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [homeMenuFavoritesStorageKey]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -325,6 +518,31 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     }
   }, [homeMenuOrderStorageKey]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!homeMenuFavoritesStorageKey) {
+      setFavoriteMenuIds([]);
+      return;
+    }
+
+    try {
+      const raw = localStorage.getItem(homeMenuFavoritesStorageKey);
+      if (!raw) {
+        setFavoriteMenuIds([]);
+        return;
+      }
+
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        setFavoriteMenuIds(parsed.filter((v) => typeof v === "string"));
+      } else {
+        setFavoriteMenuIds([]);
+      }
+    } catch {
+      setFavoriteMenuIds([]);
+    }
+  }, [homeMenuFavoritesStorageKey]);
+
   const orderedVisibleMenuItemIds = useMemo(() => {
     const currentIds = visibleMenuItems.map((item) => item.id);
     if (currentIds.length === 0) return [];
@@ -348,7 +566,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     try {
       localStorage.setItem(
         homeMenuOrderStorageKey,
-        JSON.stringify(orderedVisibleMenuItemIds)
+        JSON.stringify(orderedVisibleMenuItemIds),
       );
     } catch {
       // ignore
@@ -356,12 +574,27 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
   }, [homeMenuOrderStorageKey, orderedVisibleMenuItemIds, savedMenuOrder]);
 
   const orderedVisibleMenuItems = useMemo(() => {
-    const byId = new Map(visibleMenuItems.map((item) => [item.id, item] as const));
+    const byId = new Map(
+      visibleMenuItems.map((item) => [item.id, item] as const),
+    );
     return orderedVisibleMenuItemIds
       .map((id) => byId.get(id))
       .filter(Boolean) as typeof visibleMenuItems;
   }, [visibleMenuItems, orderedVisibleMenuItemIds]);
 
+  const favoriteVisibleMenuItems = useMemo(() => {
+    if (favoriteMenuIds.length === 0) return [];
+    const byId = new Map(
+      visibleMenuItems.map((item) => [item.id, item] as const),
+    );
+    return favoriteMenuIds
+      .map((id) => byId.get(id))
+      .filter(Boolean) as typeof visibleMenuItems;
+  }, [favoriteMenuIds, visibleMenuItems]);
+
+  const displayedMenuItems = showFavoritesView
+    ? favoriteVisibleMenuItems
+    : orderedVisibleMenuItems;
   const reorderEnabled = enableHomeMenuSortMobile;
 
   const sensors = useSensors(
@@ -375,34 +608,38 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
         delay: 200,
         tolerance: 8,
       },
-    })
+    }),
   );
 
   const [lastDragEndAt, setLastDragEndAt] = useState(0);
 
   const hasSupplierWeekPermission = Boolean(
-    resolvedPermissions?.supplierorders || resolvedPermissions?.fondogeneral
+    resolvedPermissions?.supplierorders || resolvedPermissions?.fondogeneral,
   );
   const isSupplierWeekRoute = currentHash === "#SupplierWeek";
+  const shouldShowSupplierWeekCard =
+    hasSupplierWeekPermission && (!showFavoritesView || isSupplierWeekRoute);
   const showOnlySupplierWeek = isSupplierWeekRoute && hasSupplierWeekPermission;
   const showExpandedSupplierWeek =
-    hasSupplierWeekPermission && (isSupplierWeekRoute || showSupplierWeekInMenu);
+    hasSupplierWeekPermission &&
+    (isSupplierWeekRoute || showSupplierWeekInMenu);
 
   const canChangeSupplierWeekCompany =
     currentUser?.role === "admin" || currentUser?.role === "superadmin";
 
   const assignedCompanyForProviders = (currentUser?.ownercompanie || "").trim();
-  const [supplierWeekCompanySelection, setSupplierWeekCompanySelection] = useState<string>(
-    () => assignedCompanyForProviders
-  );
-  const [supplierWeekCompany, setSupplierWeekCompany] = useState<string>(() =>
-    assignedCompanyForProviders
+  const [supplierWeekCompanySelection, setSupplierWeekCompanySelection] =
+    useState<string>(() => assignedCompanyForProviders);
+  const [supplierWeekCompany, setSupplierWeekCompany] = useState<string>(
+    () => assignedCompanyForProviders,
   );
   const [supplierWeekCompanyOptions, setSupplierWeekCompanyOptions] = useState<
     Array<{ label: string; value: string }>
   >([]);
-  const [supplierWeekCompanyOptionsLoading, setSupplierWeekCompanyOptionsLoading] =
-    useState(false);
+  const [
+    supplierWeekCompanyOptionsLoading,
+    setSupplierWeekCompanyOptionsLoading,
+  ] = useState(false);
 
   // When the supplier week card is shown in the Home menu, it must always reflect the current week.
   useEffect(() => {
@@ -445,7 +682,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
       window.removeEventListener("storage", handleStorage);
       window.removeEventListener(
         "pricemaster:preference-change",
-        handlePrefChange
+        handlePrefChange,
       );
     };
   }, []);
@@ -460,8 +697,12 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
       setSupplierWeekCompany(assignedCompanyForProviders);
       return;
     }
-    setSupplierWeekCompanySelection((prev) => (prev ? prev : assignedCompanyForProviders));
-    setSupplierWeekCompany((prev) => (prev ? prev : assignedCompanyForProviders));
+    setSupplierWeekCompanySelection((prev) =>
+      prev ? prev : assignedCompanyForProviders,
+    );
+    setSupplierWeekCompany((prev) =>
+      prev ? prev : assignedCompanyForProviders,
+    );
   }, [currentUser, assignedCompanyForProviders]);
 
   useEffect(() => {
@@ -483,13 +724,16 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
           owned = allEmpresas || [];
         } else {
           const resolvedOwnerId =
-            currentUser.ownerId || (currentUser.eliminate === false ? currentUser.id : "") || "";
+            currentUser.ownerId ||
+            (currentUser.eliminate === false ? currentUser.id : "") ||
+            "";
 
           owned = (allEmpresas || []).filter((e: any) => {
             if (!e) return false;
             const ownerId = e.ownerId || "";
 
-            const ownerIdMatch = ownerId && String(ownerId) === String(resolvedOwnerId);
+            const ownerIdMatch =
+              ownerId && String(ownerId) === String(resolvedOwnerId);
 
             const name = e.name || "";
             const ubicacion = e.ubicacion || "";
@@ -509,7 +753,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
             return { label: String(label), value: String(value) };
           })
           .filter((x) => x.value.trim().length > 0)
-          .sort((a, b) => a.label.localeCompare(b.label, "es", { sensitivity: "base" }));
+          .sort((a, b) =>
+            a.label.localeCompare(b.label, "es", { sensitivity: "base" }),
+          );
 
         if (cancelled) return;
         setSupplierWeekCompanyOptions(mapped);
@@ -562,7 +808,12 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     return () => {
       cancelled = true;
     };
-  }, [showExpandedSupplierWeek, canChangeSupplierWeekCompany, currentUser, assignedCompanyForProviders]);
+  }, [
+    showExpandedSupplierWeek,
+    canChangeSupplierWeekCompany,
+    currentUser,
+    assignedCompanyForProviders,
+  ]);
 
   const companyForProviders = supplierWeekCompany;
   const {
@@ -591,7 +842,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     const hasAnyProviders = (weeklyProviders || []).length > 0;
     if (hasAnyProviders) return;
 
-    const option = supplierWeekCompanyOptions.find((o) => o.value === selectedValue);
+    const option = supplierWeekCompanyOptions.find(
+      (o) => o.value === selectedValue,
+    );
     const alt = (option?.label || "").trim();
     if (!alt || alt === activeKey) return;
 
@@ -623,9 +876,8 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
 
     let cancelled = false;
     const load = async () => {
-      const companyKey = MovimientosFondosService.buildCompanyMovementsKey(
-        normalizedCompany
-      );
+      const companyKey =
+        MovimientosFondosService.buildCompanyMovementsKey(normalizedCompany);
 
       let resolved = null as Awaited<
         ReturnType<typeof MovimientosFondosService.getDocument>
@@ -647,11 +899,14 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
             const parsed = JSON.parse(raw);
             resolved = MovimientosFondosService.ensureMovementStorageShape(
               parsed,
-              normalizedCompany
+              normalizedCompany,
             );
           }
         } catch (err) {
-          console.error("Error reading Fondo General balances from cache:", err);
+          console.error(
+            "Error reading Fondo General balances from cache:",
+            err,
+          );
         }
       }
 
@@ -664,7 +919,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
 
       const crcBalance =
         resolved.state.balancesByAccount.find(
-          (b) => b.accountId === "FondoGeneral" && b.currency === "CRC"
+          (b) => b.accountId === "FondoGeneral" && b.currency === "CRC",
         )?.currentBalance ?? 0;
 
       setFondoGeneralBalanceCRC(crcBalance);
@@ -696,14 +951,20 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
 
     const MS_PER_WEEK = 7 * 24 * 60 * 60 * 1000;
     const intervalWeeksForFrequency = (frequencyRaw: unknown): number => {
-      const freq = typeof frequencyRaw === "string" ? frequencyRaw.trim().toUpperCase() : "SEMANAL";
+      const freq =
+        typeof frequencyRaw === "string"
+          ? frequencyRaw.trim().toUpperCase()
+          : "SEMANAL";
       if (freq === "QUINCENAL") return 2;
       if (freq === "22 DIAS") return 3; // cada ~3 semanas
       if (freq === "MENSUAL") return 4;
       return 1;
     };
 
-    const providerAppliesToWeek = (visit: any, targetWeekStartKey: number): boolean => {
+    const providerAppliesToWeek = (
+      visit: any,
+      targetWeekStartKey: number,
+    ): boolean => {
       if (!visit) return false;
       const interval = intervalWeeksForFrequency(visit.frequency);
       if (interval <= 1) return true;
@@ -713,7 +974,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
         return true;
       }
       const anchorWeekStart = weekStartKeyFromDateKey(startDateKey);
-      const diffWeeks = Math.round((targetWeekStartKey - anchorWeekStart) / MS_PER_WEEK);
+      const diffWeeks = Math.round(
+        (targetWeekStartKey - anchorWeekStart) / MS_PER_WEEK,
+      );
       const mod = ((diffWeeks % interval) + interval) % interval;
       return mod === 0;
     };
@@ -736,7 +999,11 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     type ProviderRef = { code: string; name: string };
     const visitProviders = (weeklyProviders || []).filter((p) => {
       const type = (p.type || "").toUpperCase();
-      return type === "COMPRA INVENTARIO" && !!p.visit && providerAppliesToWeek((p as any).visit, weekStartKey);
+      return (
+        type === "COMPRA INVENTARIO" &&
+        !!p.visit &&
+        providerAppliesToWeek((p as any).visit, weekStartKey)
+      );
     });
 
     const createByCode = new Map<VisitDay, ProviderRef[]>();
@@ -748,7 +1015,11 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
 
     // Helper: compute the next date (same day allowed) whose VisitDay is in allowed codes.
     // We intentionally do NOT skip weekends here, because some providers may have D/S as valid receive days.
-    const nextMatchingVisitDay = (baseDate: Date, allowed: VisitDay[], includeSameDay: boolean): Date | null => {
+    const nextMatchingVisitDay = (
+      baseDate: Date,
+      allowed: VisitDay[],
+      includeSameDay: boolean,
+    ): Date | null => {
       if (!Array.isArray(allowed) || allowed.length === 0) return null;
       let candidate = new Date(baseDate);
       candidate.setHours(0, 0, 0, 0);
@@ -809,8 +1080,12 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
       const visit = (p as any).visit;
       if (!visit) return;
 
-      const createDays: VisitDay[] = Array.isArray(visit.createOrderDays) ? visit.createOrderDays : [];
-      const receiveDays: VisitDay[] = Array.isArray(visit.receiveOrderDays) ? visit.receiveOrderDays : [];
+      const createDays: VisitDay[] = Array.isArray(visit.createOrderDays)
+        ? visit.createOrderDays
+        : [];
+      const receiveDays: VisitDay[] = Array.isArray(visit.receiveOrderDays)
+        ? visit.receiveOrderDays
+        : [];
       if (createDays.length === 0 || receiveDays.length === 0) return;
 
       const providerCode = String(p.code || "");
@@ -822,7 +1097,10 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
       // offsetWeeks=-1: create happened last week (delivery could land this week)
       const offsets = [0, -1];
       for (const offsetWeeks of offsets) {
-        const createWeekStartDate = addDays(new Date(weekStartKey), offsetWeeks * 7);
+        const createWeekStartDate = addDays(
+          new Date(weekStartKey),
+          offsetWeeks * 7,
+        );
         createWeekStartDate.setHours(0, 0, 0, 0);
         const createWeekStartKey = dateToKey(createWeekStartDate);
 
@@ -833,8 +1111,14 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
           if (idx < 0) continue;
 
           const createDate = addDays(createWeekStartDate, idx);
-          const includeSameDay = receiveDays.includes(visitDayFromDate(createDate) as VisitDay);
-          const deliveryDate = nextMatchingVisitDay(createDate, receiveDays, includeSameDay);
+          const includeSameDay = receiveDays.includes(
+            visitDayFromDate(createDate) as VisitDay,
+          );
+          const deliveryDate = nextMatchingVisitDay(
+            createDate,
+            receiveDays,
+            includeSameDay,
+          );
           if (!deliveryDate) continue;
 
           if (!isDateWithinWeek(deliveryDate, start)) continue;
@@ -844,7 +1128,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
           if (!receiveByCode.has(receiveCode) || !set) continue;
           if (set.has(providerCode)) continue;
           set.add(providerCode);
-          receiveByCode.get(receiveCode)!.push({ code: providerCode, name: providerName });
+          receiveByCode
+            .get(receiveCode)!
+            .push({ code: providerCode, name: providerName });
         }
       }
     });
@@ -853,7 +1139,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
       list
         .map((p) => ({ code: p.code.trim(), name: p.name.trim() }))
         .filter((p) => p.code && p.name)
-        .sort((a, b) => a.name.localeCompare(b.name, "es", { sensitivity: "base" }));
+        .sort((a, b) =>
+          a.name.localeCompare(b.name, "es", { sensitivity: "base" }),
+        );
 
     WEEK_DAY_CODES.forEach((c) => {
       createByCode.set(c, sortProviders(createByCode.get(c) || []));
@@ -873,8 +1161,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     if (!weekModel.days || weekModel.days.length === 0) return "";
     const start = weekModel.days[0].date;
     const end = weekModel.days[weekModel.days.length - 1].date;
-    const days = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
-    const fmt = (d: Date) => `${days[d.getDay()]}: ${d.getDate()}/${d.getMonth() + 1}`;
+    const days = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+    const fmt = (d: Date) =>
+      `${days[d.getDay()]}: ${d.getDate()}/${d.getMonth() + 1}`;
     return `${fmt(start)} – ${fmt(end)}`;
   })();
 
@@ -890,7 +1179,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     return `pricemaster:controlpedido:${c}__${wk}`;
   }, [companyForProviders, weekModel.weekStartKey]);
 
-  const [cachedControlEntries, setCachedControlEntries] = useState<ControlPedidoEntry[]>([]);
+  const [cachedControlEntries, setCachedControlEntries] = useState<
+    ControlPedidoEntry[]
+  >([]);
 
   const {
     entries: controlEntries,
@@ -901,7 +1192,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
   } = useControlPedido(
     controlPedidoEnabled ? companyForProviders : undefined,
     controlPedidoEnabled ? weekModel.weekStartKey : undefined,
-    controlPedidoEnabled
+    controlPedidoEnabled,
   );
 
   // Persist latest control entries to localStorage (for menu mode display) and keep in-memory cache.
@@ -959,7 +1250,12 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
           const receiveDateKey = Number(e?.receiveDateKey);
           const amount = Number(e?.amount);
           if (!providerCode || !providerName) return null;
-          if (!Number.isFinite(createDateKey) || !Number.isFinite(receiveDateKey) || !Number.isFinite(amount)) return null;
+          if (
+            !Number.isFinite(createDateKey) ||
+            !Number.isFinite(receiveDateKey) ||
+            !Number.isFinite(amount)
+          )
+            return null;
           return {
             id: String(e?.id || `${providerCode}__${receiveDateKey}`),
             providerCode,
@@ -1017,7 +1313,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     return (weekModel.visitProviders || [])
       .filter((p) => (p.visit?.createOrderDays || []).includes(dayCode))
       .sort((a, b) =>
-        a.name.localeCompare(b.name, "es", { sensitivity: "base" })
+        a.name.localeCompare(b.name, "es", { sensitivity: "base" }),
       );
   })();
 
@@ -1028,11 +1324,18 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
   const isImmediateDeliveryProvider = Boolean(
     selectedProvider &&
     selectedDay &&
-    (selectedProvider.visit?.receiveOrderDays || []).includes(selectedDay.code as VisitDay)
+    (selectedProvider.visit?.receiveOrderDays || []).includes(
+      selectedDay.code as VisitDay,
+    ),
   );
 
-  const computeDefaultReceiveDateKey = (providerCode: string, createDate: Date): number => {
-    const provider = (weekModel.visitProviders || []).find((p) => p.code === providerCode);
+  const computeDefaultReceiveDateKey = (
+    providerCode: string,
+    createDate: Date,
+  ): number => {
+    const provider = (weekModel.visitProviders || []).find(
+      (p) => p.code === providerCode,
+    );
     const receiveDays = provider?.visit?.receiveOrderDays || [];
 
     if (!provider || receiveDays.length === 0) return dateToKey(createDate);
@@ -1066,7 +1369,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     }
 
     setSelectedReceiveDateKey(
-      computeDefaultReceiveDateKey(selectedProviderCode, selectedDay.date)
+      computeDefaultReceiveDateKey(selectedProviderCode, selectedDay.date),
     );
   }, [selectedDay?.dateKey, selectedProviderCode, isImmediateDeliveryProvider]);
 
@@ -1077,7 +1380,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     });
   };
 
-  const effectiveControlEntries = controlPedidoEnabled ? controlEntries : cachedControlEntries;
+  const effectiveControlEntries = controlPedidoEnabled
+    ? controlEntries
+    : cachedControlEntries;
 
   const receiveAmountsByDateKey = useMemo(() => {
     const byDateKey = new Map<number, Map<string, number>>();
@@ -1097,21 +1402,27 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
         byDateKey.set(receiveDateKey, byProvider);
       }
 
-      byProvider.set(providerCode, (byProvider.get(providerCode) || 0) + amount);
+      byProvider.set(
+        providerCode,
+        (byProvider.get(providerCode) || 0) + amount,
+      );
     }
     return byDateKey;
   }, [effectiveControlEntries]);
 
   const receiveAmountByProviderCodeForDay = useCallback(
-    (dateKey: number) => receiveAmountsByDateKey.get(dateKey) || new Map<string, number>(),
-    [receiveAmountsByDateKey]
+    (dateKey: number) =>
+      receiveAmountsByDateKey.get(dateKey) || new Map<string, number>(),
+    [receiveAmountsByDateKey],
   );
 
   const handleSaveControlPedido = async () => {
     if (!isSupplierWeekRoute) return;
     if (!companyForProviders) return;
     if (!selectedDay) return;
-    const provider = eligibleProviders.find((p) => p.code === selectedProviderCode);
+    const provider = eligibleProviders.find(
+      (p) => p.code === selectedProviderCode,
+    );
     if (!provider) return;
 
     const parsedAmount = Number(orderAmount);
@@ -1142,13 +1453,14 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     if (!isSupplierWeekRoute) return;
     if (!companyForProviders) return;
     if (!selectedProviderCode) return;
-    if (!selectedReceiveDateKey || !Number.isFinite(selectedReceiveDateKey)) return;
+    if (!selectedReceiveDateKey || !Number.isFinite(selectedReceiveDateKey))
+      return;
 
     setOrderSaving(true);
     try {
       await deleteOrdersForProviderReceiveDay(
         selectedProviderCode,
-        selectedReceiveDateKey
+        selectedReceiveDateKey,
       );
       setOrderAmount("");
     } finally {
@@ -1162,6 +1474,59 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
       // Nota: al entrar a "Recetas" se debe ir primero a "Agregar Producto".
       const target = id === "recetas" ? "agregarproducto" : id;
       window.location.hash = `#${target}`;
+    }
+  };
+
+  const handleNavigateFavorite = (favorite: HomeMenuFavoriteOption) => {
+    if (typeof window === "undefined") return;
+
+    if (favorite.maintenanceTab) {
+      window.localStorage.setItem(
+        MAINTENANCE_TAB_STORAGE_KEY,
+        favorite.maintenanceTab,
+      );
+      window.dispatchEvent(
+        new CustomEvent(MAINTENANCE_TAB_EVENT, {
+          detail: { tab: favorite.maintenanceTab },
+        }),
+      );
+      window.location.hash = "#edit";
+      return;
+    }
+
+    window.location.hash = `#${favorite.hash}`;
+  };
+
+  const handleToggleFavorite = async (favorite: HomeMenuFavoriteOption) => {
+    if (!homeMenuFavoritesStorageKey) return;
+
+    const isActive = favoriteMenuIds.includes(favorite.id);
+    const nextIds = isActive
+      ? favoriteMenuIds.filter((id) => id !== favorite.id)
+      : [...favoriteMenuIds, favorite.id];
+
+    setFavoriteMenuIds(nextIds);
+
+    try {
+      if (isActive) {
+        await removeHomeMenuFavorite(homeMenuFavoritesStorageKey, favorite.id);
+      } else {
+        await addHomeMenuFavorite(homeMenuFavoritesStorageKey, favorite.id);
+      }
+
+      window.dispatchEvent(
+        new CustomEvent("pricemaster:home-favorites-change", {
+          detail: { userKey: homeMenuFavoritesStorageKey },
+        }),
+      );
+    } catch (error) {
+      console.error("Error updating HomeMenu favorites:", error);
+      try {
+        const ids = await getHomeMenuFavorites(homeMenuFavoritesStorageKey);
+        setFavoriteMenuIds(ids);
+      } catch {
+        // ignore secondary errors
+      }
     }
   };
 
@@ -1205,8 +1570,6 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
     }
   }, [showStickman]);
 
-
-
   return (
     <div className="flex flex-col items-center justify-center min-h-[60vh] py-8">
       <div
@@ -1217,8 +1580,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
         <Image
           src="/Logos/LogoBlanco2.png"
           alt="Time Master logo"
-          className={`w-28 h-28 mr-2 transition-transform duration-300 ${hovered ? "scale-110 rotate-12" : "scale-100"
-            }`}
+          className={`w-28 h-28 mr-2 transition-transform duration-300 ${
+            hovered ? "scale-110 rotate-12" : "scale-100"
+          }`}
           width={56}
           height={56}
           onMouseEnter={() => setHovered(true)}
@@ -1230,12 +1594,32 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
           }}
         />
       </div>
-      <h1 className="text-3xl font-bold mb-8 text-center">
-        {currentUser
-          ? `¡Qué gusto verte, ${currentUser.name ?? currentUser.email ?? "Usuario"
-          } !`
-          : "¡Qué gusto verte!"}
-      </h1>
+      <div className="relative mb-8 w-full max-w-screen-xl px-2 sm:px-4">
+        <h1 className="text-3xl font-bold text-center">
+          {currentUser
+            ? `¡Qué gusto verte, ${
+                currentUser.name ?? currentUser.email ?? "Usuario"
+              } !`
+            : "¡Qué gusto verte!"}
+        </h1>
+        <button
+          type="button"
+          onClick={() => setShowFavoritesView((prev) => !prev)}
+          className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-md transition-colors border border-[var(--input-border)] sm:right-4 ${
+            showFavoritesView
+              ? "bg-[var(--hover-bg)] text-amber-500"
+              : "text-[var(--muted-foreground)] hover:bg-[var(--hover-bg)]"
+          }`}
+          title={showFavoritesView ? "Ver menú normal" : "Ver favoritos"}
+          aria-label={
+            showFavoritesView ? "Cambiar a menú normal" : "Cambiar a favoritos"
+          }
+        >
+          <Star
+            className={`w-5 h-5 ${showFavoritesView ? "fill-current" : ""}`}
+          />
+        </button>
+      </div>
 
       {visibleMenuItems.length === 0 ? (
         <div className="text-center py-12">
@@ -1256,13 +1640,16 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 w-full max-w-screen-xl pt-4">
-          {hasSupplierWeekPermission && (
+          {shouldShowSupplierWeekCard && (
             <SupplierWeekSection
               isSupplierWeekRoute={isSupplierWeekRoute}
               showSupplierWeekInMenu={showSupplierWeekInMenu}
               companyForProviders={companyForProviders}
               companySelectorValue={supplierWeekCompanySelection}
-              canChangeCompanyForProviders={canChangeSupplierWeekCompany && !supplierWeekCompanyOptionsLoading}
+              canChangeCompanyForProviders={
+                canChangeSupplierWeekCompany &&
+                !supplierWeekCompanyOptionsLoading
+              }
               companyOptionsForProviders={supplierWeekCompanyOptions}
               onCompanyForProvidersChange={(value) => {
                 if (!canChangeSupplierWeekCompany) return;
@@ -1277,12 +1664,12 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
               onNavigateSupplierWeek={() => handleNavigate("SupplierWeek")}
               onPrevWeek={() =>
                 setSupplierWeekAnchorKey((prev) =>
-                  dateToKey(addDays(new Date(prev), -7))
+                  dateToKey(addDays(new Date(prev), -7)),
                 )
               }
               onNextWeek={() =>
                 setSupplierWeekAnchorKey((prev) =>
-                  dateToKey(addDays(new Date(prev), 7))
+                  dateToKey(addDays(new Date(prev), 7)),
                 )
               }
               selectedDay={selectedDay}
@@ -1297,7 +1684,9 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
               controlLoading={controlLoading}
               controlError={controlError}
               formatAmount={formatAmount}
-              receiveAmountByProviderCodeForDay={receiveAmountByProviderCodeForDay}
+              receiveAmountByProviderCodeForDay={
+                receiveAmountByProviderCodeForDay
+              }
               setSelectedCreateDateKey={setSelectedCreateDateKey}
               setSelectedProviderCode={setSelectedProviderCode}
               setSelectedReceiveDateKey={setSelectedReceiveDateKey}
@@ -1307,8 +1696,10 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
             />
           )}
 
-          {!showOnlySupplierWeek && orderedVisibleMenuItems.length > 0 && (
-            reorderEnabled ? (
+          {!showOnlySupplierWeek &&
+            !showFavoritesView &&
+            displayedMenuItems.length > 0 &&
+            (reorderEnabled ? (
               <DndContext
                 sensors={sensors}
                 collisionDetection={closestCenter}
@@ -1318,15 +1709,26 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
                   if (!over) return;
                   if (active.id === over.id) return;
 
-                  const oldIndex = orderedVisibleMenuItemIds.indexOf(String(active.id));
-                  const newIndex = orderedVisibleMenuItemIds.indexOf(String(over.id));
+                  const oldIndex = orderedVisibleMenuItemIds.indexOf(
+                    String(active.id),
+                  );
+                  const newIndex = orderedVisibleMenuItemIds.indexOf(
+                    String(over.id),
+                  );
                   if (oldIndex < 0 || newIndex < 0) return;
 
-                  const nextOrder = arrayMove(orderedVisibleMenuItemIds, oldIndex, newIndex);
+                  const nextOrder = arrayMove(
+                    orderedVisibleMenuItemIds,
+                    oldIndex,
+                    newIndex,
+                  );
                   setSavedMenuOrder(nextOrder);
                   if (!homeMenuOrderStorageKey) return;
                   try {
-                    localStorage.setItem(homeMenuOrderStorageKey, JSON.stringify(nextOrder));
+                    localStorage.setItem(
+                      homeMenuOrderStorageKey,
+                      JSON.stringify(nextOrder),
+                    );
                   } catch {
                     // ignore
                   }
@@ -1336,7 +1738,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
                   items={orderedVisibleMenuItemIds}
                   strategy={rectSortingStrategy}
                 >
-                  {orderedVisibleMenuItems.map((item) => (
+                  {displayedMenuItems.map((item) => (
                     <SortableHomeMenuCard
                       key={item.id}
                       id={item.id}
@@ -1359,7 +1761,7 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
               </DndContext>
             ) : (
               <>
-                {orderedVisibleMenuItems.map((item) => (
+                {displayedMenuItems.map((item) => (
                   <button
                     key={item.id}
                     type="button"
@@ -1377,7 +1779,84 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
                   </button>
                 ))}
               </>
-            )
+            ))}
+
+          {!showOnlySupplierWeek && showFavoritesView && (
+            <>
+              <div className="col-span-full flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-xl font-semibold text-[var(--foreground)]">
+                    Favoritos
+                  </h2>
+                </div>
+              </div>
+
+              {favoritesLoading ? (
+                <div className="col-span-full rounded-xl border border-[var(--input-border)] bg-[var(--card-bg)] p-6 text-center text-[var(--muted-foreground)]">
+                  Cargando favoritos...
+                </div>
+              ) : favoriteMenuItems.length > 0 ? (
+                <>
+                  {favoriteMenuItems.map((item) => {
+                    const IconComponent = item.icon;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => handleNavigateFavorite(item)}
+                        className="bg-[var(--card-bg)] dark:bg-[var(--card-bg)] border border-[var(--input-border)] rounded-xl shadow-md p-6 flex flex-col items-center transition hover:scale-105 hover:shadow-xl focus:outline-none focus:ring-2 focus:ring-[var(--primary)] group touch-manipulation relative"
+                        style={{ minHeight: 160 }}
+                      >
+                        <span className="absolute top-3 right-3 inline-flex items-center justify-center w-8 h-8 rounded-full bg-amber-500/15 text-amber-500">
+                          <Star className="w-4 h-4 fill-current" />
+                        </span>
+                        <IconComponent className="w-10 h-10 mb-3 text-[var(--primary)] group-hover:scale-110 group-hover:text-[var(--button-hover)] transition-all" />
+                        <span className="text-lg font-semibold mb-1 text-[var(--foreground)] dark:text-[var(--foreground)]">
+                          {item.label}
+                        </span>
+                        <span className="text-sm text-[var(--muted-foreground)] text-center">
+                          {item.description}
+                        </span>
+                      </button>
+                    );
+                  })}
+
+                  <button
+                    type="button"
+                    onClick={() => setShowAddFavoriteModal(true)}
+                    className="bg-[var(--card-bg)] dark:bg-[var(--card-bg)] border border-dashed border-[var(--input-border)] rounded-xl shadow-md p-6 flex flex-col items-center justify-center transition hover:scale-105 hover:shadow-xl focus:outline-none focus:ring-2 focus:ring-[var(--primary)] group touch-manipulation"
+                    style={{ minHeight: 160 }}
+                  >
+                    <Plus className="w-10 h-10 mb-3 text-[var(--primary)] group-hover:scale-110 transition-all" />
+                    <span className="text-lg font-semibold mb-1 text-[var(--foreground)] dark:text-[var(--foreground)]">
+                      Agregar favorito
+                    </span>
+                    <span className="text-sm text-[var(--muted-foreground)] text-center">
+                      Selecciona accesos rápidos frecuentes
+                    </span>
+                  </button>
+                </>
+              ) : (
+                <div className="col-span-full bg-[var(--card-bg)] border border-[var(--input-border)] rounded-xl p-6 text-center space-y-3">
+                  <Star className="w-10 h-10 mx-auto text-amber-500" />
+                  <div>
+                    <p className="text-[var(--foreground)] font-semibold">
+                      No tienes favoritos aún
+                    </p>
+                    <p className="text-sm text-[var(--muted-foreground)] mt-1">
+                      Usa la tarjeta {"Agregar favorito"} para configurarlos.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowAddFavoriteModal(true)}
+                    className="px-4 py-2 rounded-md bg-[var(--accent)] text-[var(--accent-foreground)] hover:opacity-90 transition-opacity"
+                  >
+                    Agregar favorito
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
@@ -1386,6 +1865,111 @@ export default function HomeMenu({ currentUser }: HomeMenuProps) {
       {showStickman && (
         <div className="fixed inset-0 pointer-events-none z-50">
           <AnimatedStickman />
+        </div>
+      )}
+
+      {showAddFavoriteModal && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div className="w-full max-w-5xl max-h-[90vh] overflow-hidden bg-[var(--background)] border border-[var(--input-border)] rounded-xl shadow-2xl flex flex-col">
+            <div className="flex items-center justify-between gap-3 border-b border-[var(--input-border)] px-6 py-4">
+              <div>
+                <h3 className="text-lg font-semibold text-[var(--foreground)]">
+                  Agregar favorito
+                </h3>
+                <p className="text-sm text-[var(--muted-foreground)]">
+                  Selecciona una tarjeta para agregarla o quitarla de tus
+                  favoritos.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAddFavoriteModal(false)}
+                className="px-3 py-2 rounded-md hover:bg-[var(--hover-bg)] text-[var(--foreground)] transition-colors"
+              >
+                Cerrar
+              </button>
+            </div>
+
+            <div className="overflow-y-auto p-6 space-y-8">
+              <div className="rounded-xl border border-[var(--input-border)] bg-[var(--card-bg)] p-4">
+                <p className="text-sm text-[var(--muted-foreground)]">
+                  Favoritos activos: {favoriteMenuIds.length}
+                </p>
+              </div>
+
+              {favoriteGroupOrder.map((group) => {
+                const items = favoriteOptionsByGroup[group];
+                if (!items || items.length === 0) return null;
+
+                return (
+                  <section key={group} className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-base font-semibold text-[var(--foreground)]">
+                        {group}
+                      </h4>
+                      <span className="text-xs text-[var(--muted-foreground)]">
+                        {items.length} opción{items.length === 1 ? "" : "es"}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                      {items.map((item) => {
+                        const IconComponent = item.icon;
+                        const isActive = favoriteMenuIds.includes(item.id);
+
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => void handleToggleFavorite(item)}
+                            className={`text-left rounded-xl border p-4 transition-all hover:scale-[1.02] focus:outline-none focus:ring-2 focus:ring-[var(--primary)] ${
+                              isActive
+                                ? "border-amber-400 bg-amber-500/10"
+                                : "border-[var(--input-border)] bg-[var(--card-bg)]"
+                            }`}
+                          >
+                            <div className="flex items-start gap-3">
+                              <div
+                                className={`flex h-10 w-10 items-center justify-center rounded-lg ${isActive ? "bg-amber-500/20 text-amber-500" : "bg-[var(--hover-bg)] text-[var(--primary)]"}`}
+                              >
+                                <IconComponent className="w-5 h-5" />
+                              </div>
+
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between gap-2">
+                                  <h5 className="font-semibold text-[var(--foreground)] truncate">
+                                    {item.label}
+                                  </h5>
+                                  <span
+                                    className={`text-xs font-medium ${isActive ? "text-amber-500" : "text-[var(--muted-foreground)]"}`}
+                                  >
+                                    {isActive ? "Agregado" : "Disponible"}
+                                  </span>
+                                </div>
+                                <p className="text-sm text-[var(--muted-foreground)] mt-1">
+                                  {item.description}
+                                </p>
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                );
+              })}
+
+              {favoriteGroupOrder.every(
+                (group) =>
+                  !favoriteOptionsByGroup[group] ||
+                  favoriteOptionsByGroup[group].length === 0,
+              ) && (
+                <div className="rounded-xl border border-[var(--input-border)] bg-[var(--card-bg)] p-6 text-center text-[var(--muted-foreground)]">
+                  No hay opciones disponibles para tu rol.
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

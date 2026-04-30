@@ -12,6 +12,8 @@ type EmpresaSearchAddSectionProps = {
   actorOwnerIds?: Array<string | number>;
   companyFromUser: string;
 
+  showEmpresaSelector?: boolean;
+
   selectedEmpresa: string;
   setSelectedEmpresa: (next: string) => void;
   setEmpresaError?: (msg: string | null) => void;
@@ -23,9 +25,13 @@ type EmpresaSearchAddSectionProps = {
   searchAriaLabel: string;
   searchDisabled?: boolean;
 
-  addButtonText: string;
-  onAddClick: () => void;
+  addButtonText?: string;
+  onAddClick?: () => void;
   addDisabled?: boolean;
+
+  onRefreshClick?: () => void;
+  refreshDisabled?: boolean;
+  refreshButtonText?: string;
 };
 
 export function EmpresaSearchAddSection({
@@ -34,6 +40,7 @@ export function EmpresaSearchAddSection({
   userRole,
   actorOwnerIds,
   companyFromUser,
+  showEmpresaSelector = true,
   selectedEmpresa,
   setSelectedEmpresa,
   setEmpresaError,
@@ -46,24 +53,32 @@ export function EmpresaSearchAddSection({
   addButtonText,
   onAddClick,
   addDisabled,
+
+  onRefreshClick,
+  refreshDisabled,
+  refreshButtonText = "Actualizar",
 }: EmpresaSearchAddSectionProps) {
   return (
     <>
-      <EmpresaSelector
-        authLoading={authLoading}
-        isAdminLike={isAdminLike}
-        userRole={userRole}
-        actorOwnerIds={actorOwnerIds}
-        companyFromUser={companyFromUser}
-        selectedEmpresa={selectedEmpresa}
-        setSelectedEmpresa={setSelectedEmpresa}
-        setEmpresaError={setEmpresaError}
-        onCompanyChanged={onCompanyChanged}
-      />
+      {showEmpresaSelector && (
+        <EmpresaSelector
+          authLoading={authLoading}
+          isAdminLike={isAdminLike}
+          userRole={userRole}
+          actorOwnerIds={actorOwnerIds}
+          companyFromUser={companyFromUser}
+          selectedEmpresa={selectedEmpresa}
+          setSelectedEmpresa={setSelectedEmpresa}
+          setEmpresaError={setEmpresaError}
+          onCompanyChanged={onCompanyChanged}
+        />
+      )}
 
       <div className="flex w-full md:flex-1 flex-col md:flex-row md:flex-nowrap items-stretch md:items-end gap-2 md:gap-3">
         <div className="w-full md:w-auto md:flex-1 md:min-w-0 lg:min-w-[260px]">
-          <label className="text-[10px] sm:text-xs text-[var(--muted-foreground)] md:invisible">Buscar</label>
+          <label className="text-[10px] sm:text-xs text-[var(--muted-foreground)] md:invisible">
+            Buscar
+          </label>
           <div className="relative">
             <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--muted-foreground)]" />
             <input
@@ -77,15 +92,28 @@ export function EmpresaSearchAddSection({
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={onAddClick}
-          disabled={Boolean(addDisabled)}
-          className="w-full md:w-auto flex items-center justify-center gap-2 px-4 py-2.5 bg-[var(--accent)] text-white rounded-lg shadow-sm ring-1 ring-white/10 hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold transition-colors whitespace-nowrap"
-        >
-          <Plus className="w-4 h-4" />
-          <span>{addButtonText}</span>
-        </button>
+        {onRefreshClick && (
+          <button
+            type="button"
+            onClick={onRefreshClick}
+            disabled={Boolean(refreshDisabled)}
+            className="w-full md:w-auto flex items-center justify-center px-4 py-2.5 border border-[var(--input-border)] rounded-lg bg-transparent text-[var(--foreground)] hover:bg-[var(--muted)] disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold transition-colors whitespace-nowrap"
+          >
+            {refreshButtonText}
+          </button>
+        )}
+
+        {addButtonText && onAddClick ? (
+          <button
+            type="button"
+            onClick={onAddClick}
+            disabled={Boolean(addDisabled)}
+            className="w-full md:w-auto flex items-center justify-center gap-2 px-4 py-2.5 bg-[var(--accent)] text-white rounded-lg shadow-sm ring-1 ring-white/10 hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-semibold transition-colors whitespace-nowrap"
+          >
+            <Plus className="w-4 h-4" />
+            <span>{addButtonText}</span>
+          </button>
+        ) : null}
       </div>
     </>
   );

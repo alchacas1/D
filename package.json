@@ -21,6 +21,8 @@
     "firebase:clear": "curl -X DELETE http://localhost:3000/api/firebase-test",
     "test:users": "start test-users-functionality.html",
     "update": "node scripts/update-version.js",
+    "update-versionstorage": "node scripts/update-versionstorage.js",
+    "update-systemNotes": "node scripts/update-systemNotes.js",
     "check": "node scripts/check-version.js"
   },
   "dependencies": {
@@ -75,7 +77,7 @@
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "autoprefixer": "^10.4.21",
-    "baseline-browser-mapping": "^2.9.4",
+    "baseline-browser-mapping": "^2.10.24",
     "critters": "^0.0.23",
     "cssnano": "^7.1.2",
     "eslint": "^9",
